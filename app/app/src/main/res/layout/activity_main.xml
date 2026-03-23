@@ -1,0 +1,195 @@
+<?xml version="1.0" encoding="utf-8"?>
+<androidx.constraintlayout.widget.ConstraintLayout
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@color/bg_dark"
+    android:keepScreenOn="true">
+
+    <!-- ── Top bar: tenant name + status indicators ─────────────────── -->
+    <TextView
+        android:id="@+id/tvTenantName"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:padding="12dp"
+        android:textColor="@color/text_dim"
+        android:textSize="14sp"
+        android:text="SchoolLive"
+        app:layout_constraintTop_toTopOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toStartOf="@id/statusBar" />
+
+    <LinearLayout
+        android:id="@+id/statusBar"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:gravity="center_vertical"
+        android:padding="12dp"
+        android:layout_marginEnd="8dp"
+        app:layout_constraintTop_toTopOf="parent"
+        app:layout_constraintEnd_toEndOf="parent">
+
+        <!-- WebSocket indicator -->
+        <ImageView
+            android:id="@+id/indicatorWs"
+            android:layout_width="14dp"
+            android:layout_height="14dp"
+            android:layout_marginEnd="6dp"
+            android:src="@drawable/ic_circle"
+            app:tint="@color/orange_radio" />
+
+        <!-- Snap indicator -->
+        <ImageView
+            android:id="@+id/indicatorSnap"
+            android:layout_width="14dp"
+            android:layout_height="14dp"
+            android:src="@drawable/ic_circle"
+            app:tint="@color/red_err" />
+    </LinearLayout>
+
+    <!-- ── Clock (center) ────────────────────────────────────────────── -->
+    <LinearLayout
+        android:id="@+id/clockContainer"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:gravity="center_vertical"
+        app:layout_constraintTop_toTopOf="parent"
+        app:layout_constraintBottom_toTopOf="@id/tvNextBell"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent">
+
+        <TextView
+            android:id="@+id/tvClock"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="00:00"
+            android:textColor="@color/text_primary"
+            android:textSize="96sp"
+            android:fontFamily="monospace"
+            android:letterSpacing="-0.05" />
+
+        <TextView
+            android:id="@+id/tvSeconds"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="8dp"
+            android:layout_marginBottom="16dp"
+            android:text="00"
+            android:textColor="@color/text_dim"
+            android:textSize="36sp"
+            android:fontFamily="monospace"
+            android:gravity="bottom"
+            android:layout_gravity="bottom" />
+    </LinearLayout>
+
+    <!-- ── Next bell ─────────────────────────────────────────────────── -->
+    <TextView
+        android:id="@+id/tvNextBell"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text=""
+        android:textColor="@color/accent_blue"
+        android:textSize="18sp"
+        android:layout_marginBottom="40dp"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent" />
+
+    <!-- ── TTS Message overlay ────────────────────────────────────────── -->
+    <FrameLayout
+        android:id="@+id/overlayMessage"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:background="@color/overlay_bg"
+        android:visibility="gone">
+
+        <TextView
+            android:id="@+id/tvOverlayMessage"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_gravity="center"
+            android:gravity="center"
+            android:padding="48dp"
+            android:text=""
+            android:textColor="@color/text_primary"
+            android:textSize="36sp" />
+
+        <!-- Green-blue gradient bar at bottom (matching Python player) -->
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="6dp"
+            android:layout_gravity="bottom"
+            android:background="@drawable/gradient_progress" />
+    </FrameLayout>
+
+    <!-- ── Radio overlay ─────────────────────────────────────────────── -->
+    <FrameLayout
+        android:id="@+id/overlayRadio"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:background="@color/overlay_radio_bg"
+        android:visibility="gone">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="center"
+            android:text="📻  Rádió"
+            android:textColor="@color/orange_radio"
+            android:textSize="42sp" />
+
+        <!-- Pulsing orange bar -->
+        <View
+            android:id="@+id/viewRadioBar"
+            android:layout_width="120dp"
+            android:layout_height="6dp"
+            android:layout_gravity="bottom|center_horizontal"
+            android:layout_marginBottom="32dp"
+            android:background="@color/orange_radio" />
+    </FrameLayout>
+
+    <!-- ── Control panel (shown on tap, auto-hides after 10s) ────────── -->
+    <LinearLayout
+        android:id="@+id/controlPanel"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:gravity="center_vertical"
+        android:background="@drawable/bg_control_panel"
+        android:padding="12dp"
+        android:elevation="8dp"
+        android:visibility="gone"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintEnd_toEndOf="parent"
+        android:layout_margin="24dp">
+
+        <Button
+            android:id="@+id/btnVolDown"
+            android:layout_width="48dp"
+            android:layout_height="48dp"
+            android:text="−"
+            android:textSize="20sp"
+            style="@style/Widget.Material3.Button.IconButton" />
+
+        <TextView
+            android:id="@+id/tvVolume"
+            android:layout_width="60dp"
+            android:layout_height="wrap_content"
+            android:gravity="center"
+            android:textColor="@color/text_primary"
+            android:textSize="16sp"
+            android:text="100%" />
+
+        <Button
+            android:id="@+id/btnVolUp"
+            android:layout_width="48dp"
+            android:layout_height="48dp"
+            android:text="+"
+            android:textSize="20sp"
+            style="@style/Widget.Material3.Button.IconButton" />
+    </LinearLayout>
+
+</androidx.constraintlayout.widget.ConstraintLayout>

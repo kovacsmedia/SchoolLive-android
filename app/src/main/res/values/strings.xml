@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">SchoolLive</string>
+    <string name="provisioning_title">SchoolLive – Beállítás</string>
+    <string name="btn_connect">Csatlakozás</string>
+    <string name="status_connecting">Csatlakozás…</string>
+    <string name="status_waiting">Várakozás aktiválásra…</string>
+    <string name="next_bell">Következő csengetés: %s</string>
+    <string name="volume_label">%d%%</string>
+    <string name="radio_label">📻  Rádió</string>
+    <string name="channel_name">SchoolLive Player</string>
+    <string name="channel_description">Háttér audio lejátszás</string>
+    <string name="notif_playing">Lejátszás folyamatban</string>
+    <string name="notif_connecting">Csatlakozás…</string>
+</resources>

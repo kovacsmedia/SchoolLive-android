@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <!-- Rendszer CA-k -->
+            <certificates src="system" />
+            <!-- Beágyazott Let's Encrypt ISRG Root X1 – régi Androidokhoz -->
+            <certificates src="@raw/isrg_root_x1" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>
