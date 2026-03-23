@@ -17,10 +17,17 @@ android {
 
     signingConfigs {
         release {
-            storeFile     file(System.getenv("KEYSTORE_PATH") ?: "schoollive-release.jks")
-            storePassword System.getenv("KEYSTORE_PASSWORD") ?: "M3l1n0A!"
-            keyAlias      System.getenv("KEY_ALIAS")         ?: "schoollive"
-            keyPassword   System.getenv("KEY_PASSWORD")      ?: "M3l1n0A!"
+            def keystorePath = project.findProperty("keystorePath") ?: System.getenv("KEYSTORE_PATH")
+            def keystorePass = project.findProperty("keystorePassword") ?: System.getenv("KEYSTORE_PASSWORD")
+            def keyAliasVal  = project.findProperty("keyAlias")       ?: System.getenv("KEY_ALIAS") ?: "schoollive"
+            def keyPass      = project.findProperty("keyPassword")    ?: System.getenv("KEY_PASSWORD")
+
+            if (keystorePath && new File(keystorePath).exists()) {
+                storeFile     file(keystorePath)
+                storePassword keystorePass
+                keyAlias      keyAliasVal
+                keyPassword   keyPass
+            }
         }
     }
 
@@ -31,7 +38,10 @@ android {
         }
         release {
             minifyEnabled false
-            signingConfig signingConfigs.release
+            def keystorePath = project.findProperty("keystorePath") ?: System.getenv("KEYSTORE_PATH")
+            if (keystorePath && new File(keystorePath).exists()) {
+                signingConfig signingConfigs.release
+            }
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
         }
     }
