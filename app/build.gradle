@@ -15,22 +15,6 @@ android {
         versionName "1.1.0"
     }
 
-    signingConfigs {
-        release {
-            def keystorePath = project.findProperty("keystorePath") ?: System.getenv("KEYSTORE_PATH")
-            def keystorePass = project.findProperty("keystorePassword") ?: System.getenv("KEYSTORE_PASSWORD")
-            def keyAliasVal  = project.findProperty("keyAlias")       ?: System.getenv("KEY_ALIAS") ?: "schoollive"
-            def keyPass      = project.findProperty("keyPassword")    ?: System.getenv("KEY_PASSWORD")
-
-            if (keystorePath && new File(keystorePath).exists()) {
-                storeFile     file(keystorePath)
-                storePassword keystorePass
-                keyAlias      keyAliasVal
-                keyPassword   keyPass
-            }
-        }
-    }
-
     buildTypes {
         debug {
             applicationIdSuffix ".debug"
@@ -38,10 +22,7 @@ android {
         }
         release {
             minifyEnabled false
-            def keystorePath = project.findProperty("keystorePath") ?: System.getenv("KEYSTORE_PATH")
-            if (keystorePath && new File(keystorePath).exists()) {
-                signingConfig signingConfigs.release
-            }
+            // Aláírás a workflow-ban történik apksigner-rel
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
         }
     }
