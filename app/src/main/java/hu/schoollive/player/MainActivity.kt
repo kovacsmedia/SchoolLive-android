@@ -24,39 +24,41 @@ class MainActivity : AppCompatActivity() {
     private lateinit var binding: ActivityMainBinding
 
     private var playerService: PlayerService? = null
-    private var serviceBound = false
+    private var serviceBound  = false
 
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName, binder: IBinder) {
             playerService = (binder as PlayerService.LocalBinder).getService()
-            serviceBound = true
+            serviceBound  = true
             attachServiceCallbacks()
         }
         override fun onServiceDisconnected(name: ComponentName) { serviceBound = false }
     }
 
-    private val clockHandler    = Handler(Looper.getMainLooper())
-    private val controlHandler  = Handler(Looper.getMainLooper())
-    private val overlayHandler  = Handler(Looper.getMainLooper())
+    private val clockHandler   = Handler(Looper.getMainLooper())
+    private val controlHandler = Handler(Looper.getMainLooper())
+    private val overlayHandler = Handler(Looper.getMainLooper())
+    private val countdownHandler = Handler(Looper.getMainLooper())
     private var volume = 100
+
+    // Aktuális overlay állapot – prioritás kezeléshez
+    private enum class OverlayState { NONE, BELL, MESSAGE, RADIO }
+    private var currentOverlay = OverlayState.NONE
+    private var overlayDurationMs: Long? = null
+    private var overlayStartMs: Long     = 0
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-
         if (!PrefsUtil.isProvisioned(this)) {
             startActivity(Intent(this, ProvisioningActivity::class.java))
-            finish()
-            return
+            finish(); return
         }
-
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         setFullscreen()
-
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
-
         setupUi()
         startClock()
         startAndBindService()
@@ -69,6 +71,7 @@ class MainActivity : AppCompatActivity() {
         clockHandler.removeCallbacksAndMessages(null)
         controlHandler.removeCallbacksAndMessages(null)
         overlayHandler.removeCallbacksAndMessages(null)
+        countdownHandler.removeCallbacksAndMessages(null)
         if (serviceBound) { unbindService(serviceConnection); serviceBound = false }
     }
 
@@ -98,8 +101,11 @@ class MainActivity : AppCompatActivity() {
                     binding.indicatorSnap.setColorFilter(
                         if (connected) getColor(R.color.green_ok) else getColor(R.color.red_err)
                     )
+                    // Ha Snap lecsatlakozik és rádió overlay van → elrejtjük
+                    if (!connected && currentOverlay == OverlayState.RADIO) hideOverlay()
                 }
             }
+
             onWsStateChanged = { connected ->
                 runOnUiThread {
                     binding.indicatorWs.setColorFilter(
@@ -107,12 +113,68 @@ class MainActivity : AppCompatActivity() {
                     )
                 }
             }
-            onMessage = { text -> runOnUiThread { showMessageOverlay(text) } }
-            onPlay    = { _    -> runOnUiThread {
-                if (binding.overlayMessage.visibility != View.VISIBLE) showRadioOverlay()
-                scheduleAutoHide()
-            }}
-            onStop    = { runOnUiThread { hideOverlay() } }
+
+            // ── Bell – legmagasabb prioritás ──────────────────────────────────
+            onBell = { soundFile, durationMs ->
+                runOnUiThread {
+                    if (durationMs != null && durationMs > 0) {
+                        // Teljes durationMs ismert → overlay visszaszámlálóval
+                        showBellOverlay(durationMs)
+                    } else if (soundFile.isNotEmpty()) {
+                        // Csak PREPARE érkezett, durationMs még nem ismert
+                        // Minimális overlay mutatása, PLAY-kor frissül
+                        showBellOverlayPending()
+                    }
+                    // Bell mindig megszakítja a többi overlay-t
+                }
+            }
+
+            // ── TTS – második prioritás ───────────────────────────────────────
+            onTts = { text, durationMs ->
+                runOnUiThread {
+                    // Ha bell overlay van → ne írja felül
+                    if (currentOverlay == OverlayState.BELL) return@runOnUiThread
+                    if (text.isNotEmpty()) showMessageOverlay(text, durationMs)
+                    else if (durationMs != null && currentOverlay == OverlayState.MESSAGE) {
+                        // PLAY üzenet durationMs frissítése
+                        startOverlayCountdown(durationMs)
+                    }
+                }
+            }
+
+            // ── Rádió – legalacsonyabb prioritás, csak Snap esetén ────────────
+            onRadio = { title, snapActive ->
+                runOnUiThread {
+                    if (currentOverlay == OverlayState.BELL ||
+                        currentOverlay == OverlayState.MESSAGE) return@runOnUiThread
+                    if (!snapActive && !(playerService?.snapConnected ?: false)) {
+                        // Snap nem aktív – rádió nem szól, overlay sem jelenik meg
+                        return@runOnUiThread
+                    }
+                    showRadioOverlay(title)
+                }
+            }
+
+            // ── Play callback (időzítés frissítés) ────────────────────────────
+            onPlay = { _, durationMs, action ->
+                runOnUiThread {
+                    if (durationMs != null && durationMs > 0) {
+                        when (action) {
+                            "BELL"    -> if (currentOverlay == OverlayState.BELL)    startOverlayCountdown(durationMs)
+                            "TTS"     -> if (currentOverlay == OverlayState.MESSAGE) startOverlayCountdown(durationMs)
+                            "PLAY_URL"-> { /* rádiónak nincs countdown */ }
+                        }
+                    }
+                    // STOP fallback ha durationMs nem érkezne
+                    if (durationMs == null && action != "PLAY_URL") {
+                        scheduleAutoHide(60_000L)
+                    }
+                }
+            }
+
+            // ── Stop ──────────────────────────────────────────────────────────
+            onStop = { runOnUiThread { hideOverlay() } }
+
             onBellsUpdated = { /* clock tick kezeli */ }
         }
     }
@@ -123,7 +185,6 @@ class MainActivity : AppCompatActivity() {
         val serverUrl = PrefsUtil.getServerUrl(this)
         val deviceKey = PrefsUtil.getDeviceKey(this)
         if (serverUrl.isEmpty() || deviceKey.isEmpty()) return
-
         lifecycleScope.launch(Dispatchers.IO) {
             try {
                 val resp = ApiClient.get(serverUrl).getTenantInfo(deviceKey)
@@ -138,13 +199,10 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // ── Provisioning check ────────────────────────────────────────────────────
-
     private fun checkProvisioningStatus() {
         val serverUrl  = PrefsUtil.getServerUrl(this)
         val hardwareId = hu.schoollive.player.util.DeviceIdUtil.getHardwareId(this)
         if (serverUrl.isEmpty() || hardwareId.isEmpty()) return
-
         lifecycleScope.launch(Dispatchers.IO) {
             try {
                 val resp = ApiClient.get(serverUrl).getStatus(hardwareId)
@@ -165,7 +223,6 @@ class MainActivity : AppCompatActivity() {
 
     private fun setupUi() {
         binding.tvTenantName.text = PrefsUtil.getDeviceName(this)
-
         binding.btnVolUp.setOnClickListener {
             volume = minOf(100, volume + 10)
             playerService?.setVolume(volume)
@@ -179,16 +236,15 @@ class MainActivity : AppCompatActivity() {
             autoHideControls()
         }
         binding.tvVolume.text = "$volume%"
-
         binding.root.setOnTouchListener { _, event ->
             if (event.action == MotionEvent.ACTION_UP) toggleControls()
             true
         }
-
-        binding.controlPanel.visibility   = View.GONE
-        binding.overlayMessage.visibility = View.GONE
-        binding.overlayRadio.visibility   = View.GONE
-        binding.bellPill.visibility       = View.GONE
+        binding.controlPanel.visibility        = View.GONE
+        binding.overlayMessage.visibility      = View.GONE
+        binding.overlayRadio.visibility        = View.GONE
+        binding.overlayBell.visibility         = View.GONE
+        binding.bellPill.visibility            = View.GONE
         binding.bellNotificationBar.visibility = View.GONE
     }
 
@@ -197,31 +253,62 @@ class MainActivity : AppCompatActivity() {
     private fun startClock() {
         val clockFmt = SimpleDateFormat("HH:mm:ss", Locale.getDefault())
         val dateFmt  = SimpleDateFormat("yyyy. MMMM d., EEEE", Locale("hu"))
-
         val tick = object : Runnable {
             override fun run() {
                 val now = Date()
                 binding.tvClock.text = clockFmt.format(now)
                 binding.tvDate.text  = dateFmt.format(now)
-
                 val next = playerService?.getBellManager()?.nextBellTime()
-                if (next != null) {
-                    binding.bellPill.visibility = View.VISIBLE
-                    binding.tvNextBell.text = next
-                } else {
-                    binding.bellPill.visibility = View.GONE
-                }
-
+                binding.bellPill.visibility = if (next != null) View.VISIBLE else View.GONE
+                if (next != null) binding.tvNextBell.text = next
                 clockHandler.postDelayed(this, 500)
             }
         }
         clockHandler.post(tick)
     }
 
-    // ── Overlays ──────────────────────────────────────────────────────────────
+    // ── Overlay megjelenítők ──────────────────────────────────────────────────
 
-    private fun showMessageOverlay(text: String) {
-        hideOverlay()
+    /** Bell overlay – csengőhang időtartamára megjelenik, visszaszámlálóval */
+    private fun showBellOverlay(durationMs: Long) {
+        overlayHandler.removeCallbacksAndMessages(null)
+        countdownHandler.removeCallbacksAndMessages(null)
+        hideAllOverlaysInternal()
+
+        currentOverlay    = OverlayState.BELL
+        overlayDurationMs = durationMs
+        overlayStartMs    = System.currentTimeMillis()
+
+        binding.overlayBell.visibility = View.VISIBLE
+        binding.overlayBell.alpha      = 0f
+        binding.overlayBell.animate().alpha(1f).setDuration(200).start()
+
+        startOverlayCountdown(durationMs)
+    }
+
+    /** Bell overlay PREPARE-kor – durationMs még nem ismert */
+    private fun showBellOverlayPending() {
+        if (currentOverlay == OverlayState.BELL) return  // már mutatjuk
+        overlayHandler.removeCallbacksAndMessages(null)
+        hideAllOverlaysInternal()
+        currentOverlay = OverlayState.BELL
+        binding.overlayBell.visibility = View.VISIBLE
+        binding.overlayBell.alpha      = 0f
+        binding.overlayBell.animate().alpha(1f).setDuration(200).start()
+        // Fallback auto-hide 10s ha PLAY nem jönne
+        scheduleAutoHide(10_000L)
+    }
+
+    /** TTS üzenet overlay visszaszámlálóval */
+    private fun showMessageOverlay(text: String, durationMs: Long?) {
+        overlayHandler.removeCallbacksAndMessages(null)
+        countdownHandler.removeCallbacksAndMessages(null)
+        hideAllOverlaysInternal()
+
+        currentOverlay    = OverlayState.MESSAGE
+        overlayDurationMs = durationMs
+        overlayStartMs    = System.currentTimeMillis()
+
         binding.tvOverlayMessage.text = text
         binding.tvOverlayMessage.textSize = when {
             text.length < 40  -> 48f
@@ -230,44 +317,89 @@ class MainActivity : AppCompatActivity() {
             else              -> 22f
         }
         binding.overlayMessage.visibility = View.VISIBLE
-        binding.overlayMessage.alpha = 0f
+        binding.overlayMessage.alpha      = 0f
         binding.overlayMessage.animate().alpha(1f).setDuration(300).start()
-        scheduleAutoHide()
+
+        if (durationMs != null && durationMs > 0) {
+            startOverlayCountdown(durationMs)
+        } else {
+            scheduleAutoHide(60_000L)
+        }
     }
 
-    private fun showRadioOverlay() {
-        hideOverlay()
-        binding.overlayRadio.visibility = View.VISIBLE
-        binding.overlayRadio.alpha = 0f
+    /** Rádió overlay – STOP_PLAYBACK-ig él, nincs countdown */
+    private fun showRadioOverlay(title: String = "Iskolarádió") {
+        overlayHandler.removeCallbacksAndMessages(null)
+        countdownHandler.removeCallbacksAndMessages(null)
+        hideAllOverlaysInternal()
+
+        currentOverlay    = OverlayState.RADIO
+        overlayDurationMs = null
+
+        binding.tvRadioTitle.text        = title
+        binding.overlayRadio.visibility  = View.VISIBLE
+        binding.overlayRadio.alpha        = 0f
         binding.overlayRadio.animate().alpha(1f).setDuration(300).start()
         pulseRadioBar()
     }
 
-    private fun hideOverlay() {
-        overlayHandler.removeCallbacksAndMessages(null)
-        binding.overlayMessage.animate().alpha(0f).setDuration(200).withEndAction {
-            binding.overlayMessage.visibility = View.GONE
-        }.start()
-        binding.overlayRadio.animate().alpha(0f).setDuration(200).withEndAction {
-            binding.overlayRadio.visibility = View.GONE
-        }.start()
+    private fun startOverlayCountdown(durationMs: Long) {
+        countdownHandler.removeCallbacksAndMessages(null)
+        overlayDurationMs = durationMs
+        overlayStartMs    = System.currentTimeMillis()
+        val ticker = object : Runnable {
+            override fun run() {
+                val elapsed   = System.currentTimeMillis() - overlayStartMs
+                val remaining = durationMs - elapsed
+                if (remaining <= 0) { hideOverlay(); return }
+                val progress = ((elapsed.toFloat() / durationMs) * 100).toInt()
+                when (currentOverlay) {
+                    OverlayState.BELL -> {
+                        binding.overlayProgressBar.progress = progress
+                        val remSec = (remaining / 1000).toInt()
+                        binding.tvOverlayCountdown.text = if (remSec > 0) "$remSec mp" else ""
+                    }
+                    OverlayState.MESSAGE -> {
+                        binding.overlayProgressBarMsg.progress = progress
+                        val remSec = (remaining / 1000).toInt()
+                        binding.tvOverlayCountdownMsg.text = if (remSec > 0) "$remSec mp" else ""
+                    }
+                    else -> {}
+                }
+                countdownHandler.postDelayed(this, 200)
+            }
+        }
+        countdownHandler.post(ticker)
     }
 
-    private fun scheduleAutoHide(delayMs: Long = 60_000L) {
+    fun hideOverlay() {
+        overlayHandler.removeCallbacksAndMessages(null)
+        countdownHandler.removeCallbacksAndMessages(null)
+        currentOverlay    = OverlayState.NONE
+        overlayDurationMs = null
+        hideAllOverlaysInternal()
+    }
+
+    private fun hideAllOverlaysInternal() {
+        listOf(binding.overlayBell, binding.overlayMessage, binding.overlayRadio).forEach { v ->
+            v.animate().alpha(0f).setDuration(200).withEndAction { v.visibility = View.GONE }.start()
+        }
+    }
+
+    private fun scheduleAutoHide(delayMs: Long) {
         overlayHandler.removeCallbacksAndMessages(null)
         overlayHandler.postDelayed({ hideOverlay() }, delayMs)
     }
 
     private fun pulseRadioBar() {
         if (binding.overlayRadio.visibility != View.VISIBLE) return
-        binding.viewRadioBar.animate()
-            .scaleX(1.6f).scaleY(1.3f).setDuration(600)
-            .withEndAction {
-                binding.viewRadioBar.animate()
-                    .scaleX(1f).scaleY(1f).setDuration(600)
-                    .withEndAction { pulseRadioBar() }
-                    .start()
-            }.start()
+        binding.viewRadioBar?.animate()
+            ?.scaleX(1.6f)?.scaleY(1.3f)?.setDuration(600)
+            ?.withEndAction {
+                binding.viewRadioBar?.animate()
+                    ?.scaleX(1f)?.scaleY(1f)?.setDuration(600)
+                    ?.withEndAction { pulseRadioBar() }?.start()
+            }?.start()
     }
 
     // ── Controls panel ────────────────────────────────────────────────────────
@@ -278,7 +410,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun showControls() {
         binding.controlPanel.visibility = View.VISIBLE
-        binding.controlPanel.alpha = 0f
+        binding.controlPanel.alpha      = 0f
         binding.controlPanel.animate().alpha(1f).setDuration(200).start()
         autoHideControls()
     }

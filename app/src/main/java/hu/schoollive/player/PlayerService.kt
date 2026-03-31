@@ -20,8 +20,8 @@ import kotlinx.coroutines.*
 private const val TAG = "PlayerService"
 private const val NOTIF_CHANNEL = "schoollive_player"
 private const val NOTIF_ID = 1
-private const val BEACON_INTERVAL_MS = 30_000L
-private const val BELLS_REFRESH_INTERVAL_MS = 300_000L   // 5 perc
+private const val BEACON_INTERVAL_MS        = 30_000L
+private const val BELLS_REFRESH_INTERVAL_MS = 300_000L
 
 class PlayerService : Service() {
 
@@ -31,20 +31,26 @@ class PlayerService : Service() {
     private val binder = LocalBinder()
     override fun onBind(intent: Intent): IBinder = binder
 
-    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val scope       = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var snapClient: SnapcastClient? = null
-    private var syncClient: SyncClient? = null
-    private var bellManager: BellManager? = null
+    private var syncClient: SyncClient?     = null
+    private var bellManager: BellManager?   = null
 
     var snapConnected = false; private set
-    var wsConnected = false; private set
+    var wsConnected   = false; private set
 
-    var onMessage: ((String) -> Unit)? = null
-    var onPlay: ((Long) -> Unit)? = null
-    var onStop: (() -> Unit)? = null
-    var onSnapStateChanged: ((Boolean) -> Unit)? = null
-    var onWsStateChanged: ((Boolean) -> Unit)? = null
-    var onBellsUpdated: (() -> Unit)? = null
+    // ── Callbacks a MainActivity felé ────────────────────────────────────────
+    var onSnapStateChanged: ((Boolean) -> Unit)?           = null
+    var onWsStateChanged:   ((Boolean) -> Unit)?           = null
+    var onBellsUpdated:     (() -> Unit)?                  = null
+
+    // Prioritásos hanglejátszás callbacks
+    // durationMs = null → nincs visszaszámlálás (rádió), vagy ismeretlen hossz
+    var onBell:  ((soundFile: String, durationMs: Long?) -> Unit)? = null
+    var onTts:   ((text: String, durationMs: Long?) -> Unit)?      = null
+    var onRadio: ((title: String, snapActive: Boolean) -> Unit)?   = null
+    var onPlay:  ((playAtMs: Long, durationMs: Long?, action: String) -> Unit)? = null
+    var onStop:  (() -> Unit)?                                     = null
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -52,7 +58,7 @@ class PlayerService : Service() {
         super.onCreate()
         bellManager = BellManager(applicationContext)
         createNotificationChannel()
-        startForeground(NOTIF_ID, buildNotification("Connecting…"))
+        startForeground(NOTIF_ID, buildNotification("Csatlakozás…"))
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -71,16 +77,14 @@ class PlayerService : Service() {
         scope.cancel()
     }
 
-    // ── BellManager elérése a MainActivity-ből ────────────────────────────────
-
     fun getBellManager(): BellManager? = bellManager
 
     // ── Connect ───────────────────────────────────────────────────────────────
 
     private fun connectAll() {
-        val ctx = applicationContext
-        val host = PrefsUtil.getSnapHost(ctx)
-        val port = PrefsUtil.getSnapPort(ctx)
+        val ctx       = applicationContext
+        val host      = PrefsUtil.getSnapHost(ctx)
+        val port      = PrefsUtil.getSnapPort(ctx)
         val deviceKey = PrefsUtil.getDeviceKey(ctx)
         val serverUrl = PrefsUtil.getServerUrl(ctx)
 
@@ -107,15 +111,47 @@ class PlayerService : Service() {
                 .replace("https://", "wss://")
                 .replace("http://", "ws://")
                 .trimEnd('/') + "/sync?deviceKey=$deviceKey"
+
             syncClient?.stop()
             syncClient = SyncClient(
                 wsUrl = wsUrl,
-                onPrepare = { _, _ -> },
-                onPlay    = { ms -> onPlay?.invoke(ms) },
-                onStop    = { onStop?.invoke() },
-                onMessage = { text -> onMessage?.invoke(text) },
-                onConnected    = { wsConnected = true;  onWsStateChanged?.invoke(true) },
-                onDisconnected = { wsConnected = false; onWsStateChanged?.invoke(false) }
+
+                onPrepare = { action, commandId ->
+                    // PREPARE-kor az overlay már megjelent (SyncClient kezeli)
+                    Log.d(TAG, "PREPARE ack: action=$action commandId=$commandId")
+                },
+
+                onPlay = { playAtMs, durationMs, action ->
+                    onPlay?.invoke(playAtMs, durationMs, action)
+                },
+
+                onStop = {
+                    onStop?.invoke()
+                },
+
+                onBell = { soundFile, durationMs ->
+                    // Bell legmagasabb prioritás – MainActivity kezeli az overlay-t
+                    onBell?.invoke(soundFile, durationMs)
+                },
+
+                onTts = { text, durationMs ->
+                    onTts?.invoke(text, durationMs)
+                },
+
+                onRadio = { title, snapActive ->
+                    // Rádió csak Snap esetén – snapActive flag alapján dönt a MainActivity
+                    onRadio?.invoke(title, snapActive)
+                },
+
+                onConnected = {
+                    wsConnected = true
+                    onWsStateChanged?.invoke(true)
+                },
+
+                onDisconnected = {
+                    wsConnected = false
+                    onWsStateChanged?.invoke(false)
+                }
             )
             syncClient?.start()
         }
@@ -128,7 +164,7 @@ class PlayerService : Service() {
     private suspend fun beaconLoop() {
         while (scope.isActive) {
             try {
-                val ctx = applicationContext
+                val ctx       = applicationContext
                 val serverUrl = PrefsUtil.getServerUrl(ctx)
                 val deviceKey = PrefsUtil.getDeviceKey(ctx)
                 if (serverUrl.isNotEmpty() && deviceKey.isNotEmpty()) {
@@ -140,12 +176,11 @@ class PlayerService : Service() {
                             wsConnected   = wsConnected,
                             volume        = 100,
                             platform      = "android",
-                            appVersion    = "Android ${android.os.Build.VERSION.RELEASE}"
+                            appVersion    = "Android ${Build.VERSION.RELEASE}"
                         )
                     )
-                    // 401 = eszközt visszatették provisioning-ba a frontenden
                     if (resp.code() == 401) {
-                        Log.w(TAG, "Beacon 401 – eszköz deaktiválva, visszatérés provisioning-ba")
+                        Log.w(TAG, "Beacon 401 – eszköz deaktiválva")
                         withContext(Dispatchers.Main) { resetToProvisioning() }
                         return
                     }
@@ -163,10 +198,9 @@ class PlayerService : Service() {
         PrefsUtil.setSnapPort(ctx, 0)
         snapClient?.stop()
         syncClient?.stop()
-        val intent = Intent(ctx, ProvisioningActivity::class.java).apply {
+        ctx.startActivity(Intent(ctx, ProvisioningActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
-        }
-        ctx.startActivity(intent)
+        })
         stopSelf()
     }
 
@@ -181,37 +215,26 @@ class PlayerService : Service() {
 
     private suspend fun refreshBells() {
         try {
-            val ctx = applicationContext
+            val ctx       = applicationContext
             val serverUrl = PrefsUtil.getServerUrl(ctx)
             val deviceKey = PrefsUtil.getDeviceKey(ctx)
             if (serverUrl.isEmpty() || deviceKey.isEmpty()) return
 
             val resp = ApiClient.get(serverUrl).getBells(deviceKey)
-            if (!resp.isSuccessful) {
-                Log.w(TAG, "Bell refresh failed: ${resp.code()}")
-                return
-            }
+            if (!resp.isSuccessful) return
 
-            val body = resp.body() ?: return
+            val body  = resp.body() ?: return
+            val bells = if (body.isHoliday) emptyList() else body.bells
 
-            val bells = if (body.isHoliday) {
-                // Ünnepnap – nincs csengetés
-                Log.d(TAG, "Bell refresh: mai nap ünnepnap, nincs csengetés")
-                emptyList()
-            } else {
-                Log.d(TAG, "Bell refresh: ${body.bells.size} csengetés betöltve")
-                body.bells
-            }
-
+            Log.d(TAG, "Bell refresh: ${bells.size} csengetés (holiday=${body.isHoliday})")
             bellManager?.updateBells(bells)
             withContext(Dispatchers.Main) { onBellsUpdated?.invoke() }
-
         } catch (e: Exception) {
             Log.w(TAG, "Bell refresh error: ${e.message}")
         }
     }
 
-    // ── OTA check ────────────────────────────────────────────────────────────
+    // ── OTA check ─────────────────────────────────────────────────────────────
 
     private fun checkOtaInBackground() {
         scope.launch {
@@ -221,9 +244,7 @@ class PlayerService : Service() {
                 val url = OtaManager(ctx).checkForUpdate()
                 if (url != null) {
                     Log.i(TAG, "OTA update available: $url")
-                    withContext(Dispatchers.Main) {
-                        OtaManager(ctx).downloadAndInstall(url)
-                    }
+                    withContext(Dispatchers.Main) { OtaManager(ctx).downloadAndInstall(url) }
                 }
             } catch (e: Exception) {
                 Log.w(TAG, "OTA check error: ${e.message}")

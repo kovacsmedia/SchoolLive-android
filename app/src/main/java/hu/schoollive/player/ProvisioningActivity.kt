@@ -32,25 +32,21 @@ class ProvisioningActivity : AppCompatActivity() {
                         View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or
                         View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
                 )
-
         binding = ActivityProvisioningBinding.inflate(layoutInflater)
         setContentView(binding.root)
-
         PrefsUtil.setServerUrl(this, SERVER_URL)
         binding.tvShortId.text = DeviceIdUtil.getShortId(this)
         binding.tvStatus.text  = "Csatlakozás a SchoolLive szerverrel…"
-
         binding.btnConnect.setOnClickListener {
             binding.btnConnect.visibility  = View.GONE
             binding.progressBar.visibility = View.VISIBLE
             startProvisioning()
         }
-
         startProvisioning()
     }
 
     private fun startProvisioning() {
-        val activity      = this          // Activity referencia rögzítése
+        val activity      = this
         val hardwareId    = DeviceIdUtil.getHardwareId(activity)
         val deviceKey     = DeviceIdUtil.getOrCreateDeviceKey(activity)
         val shortId       = DeviceIdUtil.getShortId(activity)
@@ -59,20 +55,12 @@ class ProvisioningActivity : AppCompatActivity() {
         lifecycleScope.launch(Dispatchers.IO) {
             try {
                 val resp = ApiClient.get(SERVER_URL).provision(
-                    ProvisionRequest(
-                        hardwareId    = hardwareId,
-                        deviceKeyHash = deviceKeyHash,
-                        shortId       = shortId
-                    )
+                    ProvisionRequest(hardwareId = hardwareId, deviceKeyHash = deviceKeyHash, shortId = shortId)
                 )
-
                 if (!resp.isSuccessful) {
-                    withContext(Dispatchers.Main) {
-                        showError("Szerver hiba: ${resp.code()}")
-                    }
+                    withContext(Dispatchers.Main) { showError("Szerver hiba: ${resp.code()}") }
                     return@launch
                 }
-
                 when (resp.body()?.status) {
                     "active" -> activationSuccess(activity, deviceKey)
                     else -> {
@@ -80,27 +68,19 @@ class ProvisioningActivity : AppCompatActivity() {
                             binding.progressBar.visibility = View.VISIBLE
                             binding.btnConnect.visibility  = View.GONE
                             binding.tvStatus.text =
-                                "Várakozás aktiválásra…\n\n" +
-                                        "Azonosító: $shortId\n\n" +
-                                        "Aktiválja az admin felületen!"
+                                "Várakozás aktiválásra…\n\nAzonosító: $shortId\n\nAktivál az admin felületen!"
                         }
                         polling = true
                         pollActivation(activity, hardwareId, deviceKey)
                     }
                 }
             } catch (e: Exception) {
-                withContext(Dispatchers.Main) {
-                    showError("Kapcsolati hiba:\n${e.message}")
-                }
+                withContext(Dispatchers.Main) { showError("Kapcsolati hiba:\n${e.message}") }
             }
         }
     }
 
-    private suspend fun pollActivation(
-        activity: ProvisioningActivity,
-        hardwareId: String,
-        deviceKey: String
-    ) {
+    private suspend fun pollActivation(activity: ProvisioningActivity, hardwareId: String, deviceKey: String) {
         val api = ApiClient.get(SERVER_URL)
         while (polling) {
             delay(3_000)
@@ -110,32 +90,32 @@ class ProvisioningActivity : AppCompatActivity() {
                     activationSuccess(activity, deviceKey)
                     return
                 }
-            } catch (e: Exception) {
-                // hálózati hiba – tovább pollozunk
-            }
+            } catch (e: Exception) { /* tovább pollozunk */ }
         }
     }
 
-    private suspend fun activationSuccess(
-        activity: ProvisioningActivity,
-        deviceKey: String
-    ) {
-        // Snap port lekérése IO szálon
+    private suspend fun activationSuccess(activity: ProvisioningActivity, deviceKey: String) {
+        // ── Device key mentése ────────────────────────────────────────────────
+        // Ez KRITIKUS – nélküle PlayerService üres key-vel indul,
+        // WebSocket nem csatlakozik, MainActivity visszairányít ide.
+        PrefsUtil.setDeviceKey(activity, deviceKey)
+
+        // Snap port lekérése
+        // (snap host automatikusan kiszámolódik getSnapHost()-ban a serverUrl-ből)
         try {
             val snapResp = ApiClient.get(SERVER_URL).getSnapPort(deviceKey)
             if (snapResp.isSuccessful) {
-                snapResp.body()?.snapPort?.let {
-                    PrefsUtil.setSnapPort(activity, it)
-                }
+                snapResp.body()?.snapPort?.let { PrefsUtil.setSnapPort(activity, it) }
             }
         } catch (e: Exception) { /* service újrapróbálja */ }
 
         PrefsUtil.setProvisioned(activity, true)
         polling = false
 
-        // UI műveletek főszálon
         withContext(Dispatchers.Main) {
-            activity.startActivity(Intent(activity, MainActivity::class.java))
+            activity.startActivity(Intent(activity, MainActivity::class.java).apply {
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
+            })
             activity.finish()
         }
     }

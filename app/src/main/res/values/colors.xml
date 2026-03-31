@@ -17,6 +17,7 @@
     <color name="red_err">#FFEF5350</color>
     <color name="orange_bell">#FFFFA726</color>
     <color name="orange_radio">#FFFFA726</color>
+    <color name="bell_overlay_bg">#E6331A00</color>
 
     <!-- Bell pill háttér -->
     <color name="bell_pill_bg">#CC1A2A3A</color>
