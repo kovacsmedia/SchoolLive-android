@@ -7,92 +7,76 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.net.Uri
 import android.os.Build
-import android.os.Environment
 import android.util.Log
 import androidx.core.content.FileProvider
+import hu.schoollive.player.BuildConfig
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import org.json.JSONArray
 import java.io.File
 
 private const val TAG = "OtaManager"
 private const val GITHUB_API =
-    "https://api.github.com/repos/[felhasználónév]/SchoolLive-android/releases/latest"
-private const val CURRENT_VERSION = "1.1.0"
+    "https://api.github.com/repos/kovacsmedia/SchoolLive-android/releases/latest"
 
-/**
- * Checks GitHub Releases for a newer APK and installs it.
- *
- * Usage:
- *   lifecycleScope.launch { OtaManager(context).checkAndUpdate() }
- */
 class OtaManager(private val ctx: Context) {
 
     private val http = OkHttpClient()
 
-    /**
-     * Fetches latest release tag from GitHub API.
-     * Returns the download URL if a newer version exists, null otherwise.
-     */
+    // BuildConfig.VERSION_NAME – automatikusan frissül minden buildnél
+    private val currentVersion: String get() = BuildConfig.VERSION_NAME
+
     suspend fun checkForUpdate(): String? = withContext(Dispatchers.IO) {
         try {
-            val req = Request.Builder()
-                .url(GITHUB_API)
-                .header("Accept", "application/vnd.github.v3+json")
-                .build()
+            val resp = http.newCall(
+                Request.Builder()
+                    .url(GITHUB_API)
+                    .header("Accept", "application/vnd.github.v3+json")
+                    .build()
+            ).execute()
 
-            val resp = http.newCall(req).execute()
             if (!resp.isSuccessful) return@withContext null
-
-            val body = resp.body?.string() ?: return@withContext null
-            val json = org.json.JSONObject(body)
+            val json = org.json.JSONObject(resp.body?.string() ?: return@withContext null)
 
             val latestTag = json.optString("tag_name", "").trimStart('v')
-            if (latestTag.isEmpty() || latestTag == CURRENT_VERSION) return@withContext null
+            if (latestTag.isEmpty()) return@withContext null
 
-            // Compare versions (simple string compare works for semver x.y.z)
-            if (!isNewerVersion(latestTag, CURRENT_VERSION)) return@withContext null
+            Log.d(TAG, "OTA: current=$currentVersion latest=$latestTag")
+            if (!isNewerVersion(latestTag, currentVersion)) return@withContext null
 
-            // Find APK asset URL
             val assets = json.optJSONArray("assets") ?: return@withContext null
             for (i in 0 until assets.length()) {
                 val asset = assets.getJSONObject(i)
-                val name = asset.optString("name", "")
-                if (name.endsWith(".apk")) {
-                    Log.i(TAG, "Update found: $latestTag → ${asset.optString("browser_download_url")}")
-                    return@withContext asset.optString("browser_download_url")
+                if (asset.optString("name", "").endsWith(".apk")) {
+                    val url = asset.optString("browser_download_url")
+                    Log.i(TAG, "Frissítés: $latestTag → $url")
+                    return@withContext url
                 }
             }
         } catch (e: Exception) {
-            Log.w(TAG, "OTA check failed: ${e.message}")
+            Log.w(TAG, "OTA check hiba: ${e.message}")
         }
         null
     }
 
-    /**
-     * Downloads APK via DownloadManager and triggers install intent.
-     */
     fun downloadAndInstall(apkUrl: String) {
-        val apkDir = File(ctx.cacheDir, "apk").also { it.mkdirs() }
-        val apkFile = File(apkDir, "schoollive-update.apk")
-
-        val req = DownloadManager.Request(Uri.parse(apkUrl)).apply {
-            setTitle("SchoolLive frissítés")
-            setDescription("Letöltés…")
-            setDestinationUri(Uri.fromFile(apkFile))
-            setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE)
-        }
+        val apkFile = File(ctx.cacheDir.also { File(it, "apk").mkdirs() }
+            .let { File(it, "apk") }, "schoollive-update.apk")
 
         val dm = ctx.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
-        val downloadId = dm.enqueue(req)
+        val downloadId = dm.enqueue(
+            DownloadManager.Request(Uri.parse(apkUrl)).apply {
+                setTitle("SchoolLive frissítés")
+                setDescription("Letöltés…")
+                setDestinationUri(Uri.fromFile(apkFile))
+                setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE)
+            }
+        )
 
-        // Listen for completion
         ctx.registerReceiver(object : BroadcastReceiver() {
             override fun onReceive(context: Context, intent: Intent) {
-                val id = intent.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1)
-                if (id == downloadId) {
+                if (intent.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1) == downloadId) {
                     ctx.unregisterReceiver(this)
                     installApk(apkFile)
                 }
@@ -106,12 +90,10 @@ class OtaManager(private val ctx: Context) {
         } else {
             Uri.fromFile(apkFile)
         }
-
-        val intent = Intent(Intent.ACTION_VIEW).apply {
+        ctx.startActivity(Intent(Intent.ACTION_VIEW).apply {
             setDataAndType(uri, "application/vnd.android.package-archive")
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION
-        }
-        ctx.startActivity(intent)
+        })
     }
 
     private fun isNewerVersion(latest: String, current: String): Boolean {
