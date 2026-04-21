@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <declare-styleable name="StatusIndicatorView">
+        <!-- A pont alatt megjelenő felirat (pl. "snap" vagy "net") -->
+        <attr name="label" format="string" />
+    </declare-styleable>
+</resources>

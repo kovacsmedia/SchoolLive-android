@@ -6,6 +6,10 @@ import okhttp3.*
 import org.json.JSONObject
 import java.security.SecureRandom
 import java.security.cert.X509Certificate
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.TimeZone
 import java.util.concurrent.TimeUnit
 import javax.net.ssl.SSLContext
 import javax.net.ssl.TrustManager
@@ -15,16 +19,41 @@ private const val TAG = "SyncClient"
 private const val RECONNECT_BASE_MS = 2_000L
 private const val RECONNECT_MAX_MS  = 30_000L
 
+private val ISO_FORMAT = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US).apply {
+    timeZone = TimeZone.getTimeZone("UTC")
+}
+private fun isoNow(): String = synchronized(ISO_FORMAT) { ISO_FORMAT.format(Date()) }
+
+data class BellEvent(
+    val soundFile:  String,
+    val playAtMs:   Long,
+    val durationMs: Long?,
+    val snapActive: Boolean,
+)
+
+data class TtsEvent(
+    val text:       String,
+    val playAtMs:   Long,
+    val durationMs: Long?,
+    val snapActive: Boolean,
+)
+
+data class RadioEvent(
+    val title:      String,
+    val snapActive: Boolean,
+)
+
 class SyncClient(
     private val wsUrl:          String,
-    private val onPrepare:      (action: String, commandId: String) -> Unit = { _, _ -> },
-    private val onPlay:         (playAtMs: Long, durationMs: Long?, action: String) -> Unit = { _, _, _ -> },
-    private val onStop:         () -> Unit = {},
-    private val onBell:         (soundFile: String, durationMs: Long?) -> Unit = { _, _ -> },
-    private val onTts:          (text: String, durationMs: Long?) -> Unit = { _, _ -> },
-    private val onRadio:        (title: String, snapActive: Boolean) -> Unit = { _, _ -> },
-    private val onConnected:    () -> Unit = {},
-    private val onDisconnected: () -> Unit = {}
+    private val onBell:         (BellEvent)  -> Unit = {},
+    private val onTts:          (TtsEvent)   -> Unit = {},
+    private val onRadio:        (RadioEvent) -> Unit = {},
+    private val onStop:         ()           -> Unit = {},
+    private val onSyncBells:    ()           -> Unit = {},
+    private val onConnected:    ()           -> Unit = {},
+    private val onDisconnected: ()           -> Unit = {},
+    // Net LED pulse trigger – minden beérkező WS üzenetnél hívódik.
+    private val onActivity:     ()           -> Unit = {},
 ) {
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
@@ -33,8 +62,6 @@ class SyncClient(
 
     @Volatile private var activeWs: WebSocket? = null
     private var reconnectDelay = RECONNECT_BASE_MS
-
-    // Függőben lévő PREPARE állapotok
     private val pendingPrepare = mutableMapOf<String, JSONObject>()
 
     private val trustAll = object : X509TrustManager {
@@ -71,30 +98,33 @@ class SyncClient(
                 activeWs?.close(1000, "Reconnecting")
                 activeWs = null
                 Log.d(TAG, "Connecting to $wsUrl")
-                activeWs = client.newWebSocket(Request.Builder().url(wsUrl).build(), listener)
+                activeWs = client.newWebSocket(
+                    Request.Builder().url(wsUrl).build(), listener
+                )
             }
             delay(reconnectDelay)
         }
     }
 
     private fun sendReadyAck(commandId: String) {
-        val json = JSONObject().apply {
+        activeWs?.send(JSONObject().apply {
             put("type",      "READY_ACK")
             put("commandId", commandId)
             put("bufferMs",  0)
-            put("readyAt",   java.time.Instant.now().toString())
-        }
-        activeWs?.send(json.toString())
-        Log.d(TAG, "READY_ACK sent: $commandId")
+            put("readyAt",   isoNow())
+        }.toString())
+        Log.d(TAG, "READY_ACK: $commandId")
     }
 
     private val listener = object : WebSocketListener() {
         override fun onOpen(webSocket: WebSocket, response: Response) {
             Log.d(TAG, "WS connected")
-            isConnected = true
+            isConnected    = true
             reconnectDelay = RECONNECT_BASE_MS
-            val syncReq = JSONObject().apply { put("type", "TIME_SYNC"); put("seq", System.currentTimeMillis()) }
-            webSocket.send(syncReq.toString())
+            webSocket.send(JSONObject().apply {
+                put("type", "TIME_SYNC")
+                put("seq",  System.currentTimeMillis())
+            }.toString())
             scope.launch(Dispatchers.Main) { onConnected() }
         }
 
@@ -102,110 +132,120 @@ class SyncClient(
 
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
             Log.w(TAG, "WS failure: ${t.message}")
-            isConnected = false; activeWs = null
+            isConnected    = false
+            activeWs       = null
             reconnectDelay = minOf(reconnectDelay * 2, RECONNECT_MAX_MS)
             scope.launch(Dispatchers.Main) { onDisconnected() }
         }
 
         override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-            Log.d(TAG, "WS closed: $code")
-            isConnected = false; activeWs = null
+            Log.d(TAG, "WS closed: $code $reason")
+            isConnected = false
+            activeWs    = null
             scope.launch(Dispatchers.Main) { onDisconnected() }
         }
     }
 
     private fun handleMessage(text: String) {
+        // Net LED pulse – minden beérkező WS üzenet aktivitást jelez
+        onActivity()
         try {
             val json       = JSONObject(text)
             val phase      = json.optString("phase",  "")
             val type       = json.optString("type",   "")
             val action     = json.optString("action", "")
             val snapActive = json.optBoolean("snapcastActive", false)
-            val durationMs = if (json.has("durationMs")) json.getLong("durationMs") else null
 
             when {
-                // ── PREPARE ───────────────────────────────────────────────────
+                // ── PREPARE: csak tároljuk + ACK ─────────────────────────────
                 phase == "PREPARE" -> {
                     val commandId = json.optString("commandId", "")
-                    Log.d(TAG, "PREPARE action=$action commandId=$commandId snap=$snapActive")
+                    Log.d(TAG, "PREPARE: action=$action commandId=$commandId snap=$snapActive")
                     pendingPrepare[commandId] = json
-
-                    // Overlay előzetes megjelenítése (Snap hamarosan szólni fog)
-                    when (action) {
-                        "BELL" -> {
-                            val sf = json.optString("url", "").substringAfterLast("/")
-                            scope.launch(Dispatchers.Main) { onBell(sf, null) }
-                        }
-                        "TTS" -> {
-                            val t = json.optString("text", json.optString("title", ""))
-                            scope.launch(Dispatchers.Main) { onTts(t, null) }
-                        }
-                        "PLAY_URL" -> {
-                            val title = json.optString("title", "Iskolarádió")
-                            scope.launch(Dispatchers.Main) { onRadio(title, snapActive) }
-                        }
-                    }
                     sendReadyAck(commandId)
-                    scope.launch(Dispatchers.Main) { onPrepare(action, commandId) }
                 }
 
-                // ── PLAY ──────────────────────────────────────────────────────
+                // ── PLAY: overlay + hang triggerelés ──────────────────────────
                 phase == "PLAY" -> {
-                    val commandId  = json.optString("commandId", "")
-                    val playAtMs   = json.optLong("playAtMs", System.currentTimeMillis())
-                    val dur        = if (json.has("durationMs")) json.getLong("durationMs") else null
-                    val prepare    = pendingPrepare.remove(commandId)
-                    val prepAction = prepare?.optString("action", "") ?: ""
+                    val commandId      = json.optString("commandId", "")
+                    val playAtMs       = json.optLong("playAtMs", System.currentTimeMillis())
+                    val durationMs     = if (json.has("durationMs")) json.getLong("durationMs") else null
+                    val prepare        = pendingPrepare.remove(commandId) ?: run {
+                        Log.w(TAG, "PLAY: nincs PREPARE párja: $commandId"); return
+                    }
+                    val prepAction     = prepare.optString("action", "")
+                    val prepSnapActive = prepare.optBoolean("snapcastActive", false)
 
                     val diffMs = playAtMs - System.currentTimeMillis()
-                    Log.d(TAG, "PLAY action=$prepAction diffMs=$diffMs dur=${dur}ms")
+                    Log.d(TAG, "PLAY: action=$prepAction diffMs=${diffMs}ms dur=${durationMs}ms")
 
-                    if (diffMs < -10_000) {
+                    if (diffMs < -10_000L) {
                         Log.w(TAG, "PLAY stale (${-diffMs}ms) → skip"); return
                     }
 
-                    val firePlay: () -> Unit = {
-                        scope.launch(Dispatchers.Main) {
-                            onPlay(playAtMs, dur, prepAction)
-                            // durationMs frissítés az overlay-nek
-                            if (dur != null) when (prepAction) {
-                                "TTS"  -> onTts("", dur)
-                                "BELL" -> onBell("", dur)
+                    val delayMs = if (diffMs > 0) diffMs else 0L
+                    scope.launch {
+                        if (delayMs > 0) delay(delayMs)
+                        val url = prepare.optString("url", "")
+                        withContext(Dispatchers.Main) {
+                            when (prepAction) {
+                                "BELL" -> onBell(BellEvent(
+                                    soundFile  = url.substringAfterLast("/"),
+                                    playAtMs   = playAtMs,
+                                    durationMs = durationMs,
+                                    snapActive = prepSnapActive,
+                                ))
+                                "TTS" -> onTts(TtsEvent(
+                                    text       = prepare.optString("text", ""),
+                                    playAtMs   = playAtMs,
+                                    durationMs = durationMs,
+                                    snapActive = prepSnapActive,
+                                ))
+                                "PLAY_URL" -> onRadio(RadioEvent(
+                                    title      = prepare.optString("title", "Iskolarádió"),
+                                    snapActive = prepSnapActive,
+                                ))
                             }
                         }
                     }
-
-                    if (diffMs > 50) {
-                        scope.launch { delay(diffMs); firePlay() }
-                    } else {
-                        firePlay()
-                    }
                 }
 
-                // ── Azonnali broadcast (action van, phase nincs) ──────────────
+                // ── Azonnali broadcast ────────────────────────────────────────
                 action.isNotEmpty() && phase.isEmpty() -> {
-                    Log.d(TAG, "Immediate action=$action snap=$snapActive dur=$durationMs")
-                    when (action) {
-                        "BELL" -> {
-                            val sf = json.optString("url", "").substringAfterLast("/")
-                            scope.launch(Dispatchers.Main) { onBell(sf, durationMs) }
+                    val durationMs = if (json.has("durationMs")) json.getLong("durationMs") else null
+                    Log.d(TAG, "Broadcast: action=$action snap=$snapActive dur=$durationMs")
+                    scope.launch(Dispatchers.Main) {
+                        when (action) {
+                            "BELL" -> onBell(BellEvent(
+                                soundFile  = json.optString("url","").substringAfterLast("/"),
+                                playAtMs   = System.currentTimeMillis(),
+                                durationMs = durationMs,
+                                snapActive = snapActive,
+                            ))
+                            "TTS" -> onTts(TtsEvent(
+                                text       = json.optString("text", ""),
+                                playAtMs   = System.currentTimeMillis(),
+                                durationMs = durationMs,
+                                snapActive = snapActive,
+                            ))
+                            "PLAY_URL" -> onRadio(RadioEvent(
+                                title      = json.optString("title", "Iskolarádió"),
+                                snapActive = snapActive,
+                            ))
+                            "STOP_PLAYBACK" -> onStop()
+
+                            // ── Bell szinkron push – azonnal frissít ──────────
+                            // A backend bármilyen bell schedule változáskor küldi.
+                            // A kliens azonnal lekéri az aktuális bell listát.
+                            "SYNC_BELLS" -> {
+                                Log.d(TAG, "SYNC_BELLS push – bell refresh")
+                                onSyncBells()
+                            }
                         }
-                        "TTS" -> {
-                            val t = json.optString("text", json.optString("title", ""))
-                            scope.launch(Dispatchers.Main) { onTts(t, durationMs) }
-                        }
-                        "PLAY_URL" -> {
-                            val title = json.optString("title", "Iskolarádió")
-                            scope.launch(Dispatchers.Main) { onRadio(title, snapActive) }
-                        }
-                        "STOP_PLAYBACK" -> scope.launch(Dispatchers.Main) { onStop() }
-                        "SYNC_BELLS"    -> Log.d(TAG, "SYNC_BELLS – bell refresh kérve")
                     }
                 }
 
-                // ── HELLO ─────────────────────────────────────────────────────
-                type == "HELLO" -> Log.d(TAG, "HELLO deviceId=${json.optString("deviceId")}")
-
+                type == "HELLO"              -> Log.d(TAG, "HELLO deviceId=${json.optString("deviceId")}")
                 type == "TIME_SYNC_RESPONSE" -> Log.d(TAG, "TIME_SYNC ok")
             }
         } catch (e: Exception) {

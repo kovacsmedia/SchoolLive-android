@@ -61,8 +61,11 @@ class OtaManager(private val ctx: Context) {
     }
 
     fun downloadAndInstall(apkUrl: String) {
-        val apkFile = File(ctx.cacheDir.also { File(it, "apk").mkdirs() }
-            .let { File(it, "apk") }, "schoollive-update.apk")
+        // DownloadManager cannot write to internal cacheDir, use externalCacheDir instead
+        val apkDir = File(ctx.externalCacheDir ?: ctx.cacheDir, "apk")
+        apkDir.mkdirs()
+        val apkFile = File(apkDir, "schoollive-update.apk")
+        if (apkFile.exists()) apkFile.delete()
 
         val dm = ctx.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
         val downloadId = dm.enqueue(

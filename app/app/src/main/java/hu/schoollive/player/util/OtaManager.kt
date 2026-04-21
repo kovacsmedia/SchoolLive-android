@@ -75,8 +75,11 @@ class OtaManager(private val ctx: Context) {
      * Downloads APK via DownloadManager and triggers install intent.
      */
     fun downloadAndInstall(apkUrl: String) {
-        val apkDir = File(ctx.cacheDir, "apk").also { it.mkdirs() }
+        // DownloadManager cannot write to internal cacheDir, use externalCacheDir instead
+        val apkDir = File(ctx.externalCacheDir ?: ctx.cacheDir, "apk")
+        apkDir.mkdirs()
         val apkFile = File(apkDir, "schoollive-update.apk")
+        if (apkFile.exists()) apkFile.delete()
 
         val req = DownloadManager.Request(Uri.parse(apkUrl)).apply {
             setTitle("SchoolLive frissítés")
