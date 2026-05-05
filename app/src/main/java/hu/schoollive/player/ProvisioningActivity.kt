@@ -62,7 +62,14 @@ class ProvisioningActivity : AppCompatActivity() {
                     return@launch
                 }
                 when (resp.body()?.status) {
-                    "active" -> activationSuccess(activity, deviceKey)
+                    "active" -> {
+                        // A backend a státusz/provision válaszában adhatja
+                        // a deviceId-t – mentsük el azonnal, hogy az első
+                        // snap HELLO és a fordított targeting fallback már
+                        // a helyes ID-t ismerje.
+                        resp.body()?.deviceId?.let { PrefsUtil.setDeviceId(activity, it) }
+                        activationSuccess(activity, deviceKey)
+                    }
                     else -> {
                         withContext(Dispatchers.Main) {
                             binding.progressBar.visibility = View.VISIBLE
@@ -87,6 +94,7 @@ class ProvisioningActivity : AppCompatActivity() {
             try {
                 val resp = api.getStatus(hardwareId)
                 if (resp.isSuccessful && resp.body()?.status == "active") {
+                    resp.body()?.deviceId?.let { PrefsUtil.setDeviceId(activity, it) }
                     activationSuccess(activity, deviceKey)
                     return
                 }

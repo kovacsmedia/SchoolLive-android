@@ -9,9 +9,14 @@ interface ApiService {
     @POST("devices/native/provision")
     suspend fun provision(@Body body: ProvisionRequest): Response<ProvisionResponse>
 
-    @GET("devices/native/status")
+    // A backend `/devices/native/status/:hardwareId` path paramétert vár
+    // (NEM header-t és NEM device-key-t). Az aktiválás állapotát a
+    // hardwareId-vel kérdezzük le, mert deviceKey csak akkor lesz, ha már
+    // aktiválva van. Régen header-rel volt, az 404-et adott → polling
+    // sosem detektálta az "active" állapotot.
+    @GET("devices/native/status/{hardwareId}")
     suspend fun getStatus(
-        @Header("x-device-key") deviceKey: String
+        @Path("hardwareId") hardwareId: String
     ): Response<ProvisionResponse>
 
     @GET("devices/native/snap-port")
