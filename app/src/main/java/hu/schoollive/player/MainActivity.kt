@@ -284,12 +284,11 @@ class MainActivity : AppCompatActivity() {
 
     // ── UI setup ──────────────────────────────────────────────────────────────
 
-    /** A megjelenített fejléc formázása: "{Név}! client V{verzió}" */
-    private fun formatClientLabel(name: String): String =
-        "${name.trimEnd('!')}! client V${BuildConfig.VERSION_NAME}"
-
     private fun setupUi() {
-        binding.tvTenantName.text = formatClientLabel(PrefsUtil.getDeviceName(this))
+        // Felső kék sor: "SchoolLive! client V{verzió}"
+        binding.tvAppName.text = "SchoolLive! client V${BuildConfig.VERSION_NAME}"
+        // Alsó szürke sor: tenant neve (szerver tölti be)
+        binding.tvTenantName.text = PrefsUtil.getDeviceName(this)
         binding.btnVolUp.setOnClickListener {
             volume = minOf(100, volume + 10)
             playerService?.setVolume(volume)
@@ -351,9 +350,7 @@ class MainActivity : AppCompatActivity() {
                     val body = resp.body()
                     val name = body?.tenantName
                     if (!name.isNullOrEmpty()) {
-                        withContext(Dispatchers.Main) {
-                            binding.tvTenantName.text = formatClientLabel(name)
-                        }
+                        withContext(Dispatchers.Main) { binding.tvTenantName.text = name }
                         PrefsUtil.setDeviceName(this@MainActivity, name)
                     }
                     // DeviceId perzisztálás (snap HELLO + unmute fallback miatt)
