@@ -33,22 +33,22 @@ jobs:
           name: schoollive-debug
           path: app/build/outputs/apk/debug/app-debug.apk
 
-      # On tagged release: build release APK and publish
-      - name: Build release APK
-        if: startsWith(github.ref, 'refs/tags/')
-        run: ./gradlew assembleRelease
-
-      - name: Create GitHub Release
+      # On tagged release: csak a release-t hozzuk létre, asset NÉLKÜL.
+      # Az aláírt APK-t a fejlesztő feltölti utólag (`gh release upload`),
+      # mert az unsigned APK nem telepíthető és az OtaManager az első
+      # `.apk`-ra végződő asset-et választja – ezért nem keverhetjük a
+      # signed-ot egy unsigned-dal.
+      - name: Create GitHub Release (asset-less)
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: app/build/outputs/apk/release/app-release-unsigned.apk
           name: SchoolLive Android ${{ github.ref_name }}
+          draft: true
           body: |
             ## SchoolLive Android Player ${{ github.ref_name }}
 
             ### Telepítés
-            1. Töltsd le az APK-t
+            1. Töltsd le az aláírt APK-t
             2. Engedélyezd az "Ismeretlen forrásból való telepítés" opciót
             3. Telepítsd az APK-t
             4. Az első indításkor add meg a szerver URL-jét
