@@ -54,13 +54,20 @@ class SnapcastClient(
     // ── Két-rétegű volume vezérlés ────────────────────────────────────────
     // user-volume: a kliens felhasználói gombokkal állítja (0-100)
     // local-mute: a backend WS protokoll fordított targeting fallback-je
-    //             (ha a saját deviceId NINCS az unmutedDeviceIds listában)
+    //             (ha a saját deviceId ISMERT és NEM szerepel az
+    //             unmutedDeviceIds listában)
     // server-mute: a snapserver JSON-RPC Client.SetVolume-jából érkezik
     //              (handleServerSettings)
     // Effektív volume = (localMuted || serverMuted) ? 0 : userVolume.
+    //
+    // FONTOS: mindkét mute alapértelmezése FALSE (hangos, backward compat).
+    // A mute csak akkor aktiválódik, ha a targeting logika BIZONYOSAN tudja,
+    // hogy ez az eszköz nincs megcélozva. Ha nincs deviceId, vagy ha a
+    // backend nem küld unmutedDeviceIds listát, az eszköz szól.
+    // Ez az iskolai rendszerben biztonságosabb fallback, mint a némaság.
     @Volatile private var userVolume:  Int     = 100
-    @Volatile private var localMuted:  Boolean = true   // alapból néma (fail-safe)
-    @Volatile private var serverMuted: Boolean = true   // alapból néma
+    @Volatile private var localMuted:  Boolean = false  // false = szól alapból
+    @Volatile private var serverMuted: Boolean = false  // false = szól alapból
     @Volatile private var serverVolume:Int     = 100
 
     @Volatile private var serverOffsetMs:    Long    = 0L

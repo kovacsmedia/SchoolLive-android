@@ -198,20 +198,31 @@ class PlayerService : Service() {
     private fun applyTargeting(unmutedDeviceIds: List<String>, durationMs: Long?) {
         val myId = PrefsUtil.getDeviceId(applicationContext)
         val sc   = snapClient ?: return
-        val unmuted = myId.isNotEmpty() && unmutedDeviceIds.contains(myId)
+
+        // Mute-ot CSAK akkor alkalmazunk, ha:
+        //   1. A saját device.id ismert (nem üres)
+        //   2. A backend küldött egy nem-üres célzási listát
+        //   3. A saját ID nincs benne a listában
+        //
+        // Ha bármelyik feltétel nem teljesül (pl. friss eszköz, még nincs
+        // device.id, vagy a lista üres) → NEM némítunk (backward-compat).
+        val certainlyNotTargeted = myId.isNotEmpty()
+            && unmutedDeviceIds.isNotEmpty()
+            && !unmutedDeviceIds.contains(myId)
 
         // Bármi is történik, az előző auto-remute timert lemondjuk.
         remuteJob?.cancel(); remuteJob = null
 
-        if (!unmuted) {
-            // Nem vagyunk célzottak → maradjon/legyen néma a snap output.
+        if (certainlyNotTargeted) {
+            // Biztosan nem célzott → néma
             sc.setLocalMute(true)
             Log.d(TAG, "Targeting: NEM célzott (myId=$myId), snap localMuted=true")
             return
         }
 
+        // Célzott, vagy uncertain (ID hiányzik / lista üres) → szól
         sc.setLocalMute(false)
-        Log.d(TAG, "Targeting: célzott (myId=$myId), snap localMuted=false, dur=$durationMs")
+        Log.d(TAG, "Targeting: célzott vagy unknown (myId=${myId.ifEmpty{"N/A"}}), snap localMuted=false, dur=$durationMs")
 
         // Auto-remute durationMs lejártakor.
         durationMs?.let { dur ->
