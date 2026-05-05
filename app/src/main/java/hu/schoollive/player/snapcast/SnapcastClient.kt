@@ -315,13 +315,19 @@ class SnapcastClient(
             val json    = JSONObject(String(ByteArray(jsonLen).also { bb.get(it) }))
             val muted   = json.optBoolean("muted", false)
             val volume  = json.optInt("volume", 100).coerceIn(0, 100)
-            // A snapserver JSON-RPC Client.SetVolume-jából érkező mute-ot is
-            // alkalmazni kell, nem csak a hangerőt – ez a backend fordított
-            // targetingjének elsődleges layere.
-            serverMuted  = muted
+            // FONTOS: a snap szerver tárolja a per-kliens muted állapotot, és a
+            // korábbi backend kód muteAll()-t hívott minden lejátszás után.
+            // Ezért a snap szerver minden csatlakozáskor muted=true-t küld,
+            // ami elnémítja az AudioTrack-et. A backendes RPC unmute nem mindig
+            // fut le időben. Ezért a snap szerver oldali `muted` flaget szándékosan
+            // FIGYELMEN KÍVÜL HAGYJUK – a hangerőt (volume %) alkalmazzuk, de a
+            // mute-ot NEM. A némutatást kizárólag a WS targetingből érkező
+            // localMuted logika végzi.
+            //
+            // serverMuted = muted   ← szándékosan ki van kommentelve
             serverVolume = volume
             applyEffectiveVolume()
-            Log.d(TAG, "ServerSettings: vol=$volume muted=$muted")
+            Log.d(TAG, "ServerSettings: vol=$volume muted=$muted (muted flag ignored)")
         } catch (e: Exception) {
             Log.w(TAG, "ServerSettings parse error: ${e.message}")
         }
