@@ -29,6 +29,11 @@ private data class AudioChunk(val pcm: ByteArray, val serverTimestampMs: Long)
 class SnapcastClient(
     private val host:           String,
     private val port:           Int,
+    /** A backend device.id, amelyet a snap HELLO `ID` mezőben elküldünk.
+     *  Ez teszi lehetővé, hogy a backend JSON-RPC-vel célozza ezt a klienst
+     *  (Client.SetVolume) per-device mute/unmute műveletekhez.
+     *  Ha üres, fallback a régi "schoollive-android" konstansra. */
+    private val deviceId:       String = "",
     private val onConnected:    () -> Unit = {},
     private val onDisconnected: () -> Unit = {},
     // Snap LED pulse trigger – minden audio chunk beérkezésekor hívódik.
@@ -45,6 +50,18 @@ class SnapcastClient(
     private var channels   = AudioFormat.CHANNEL_OUT_STEREO
     private var encoding   = AudioFormat.ENCODING_PCM_16BIT
     private var bytesPerMs = 192
+
+    // ── Két-rétegű volume vezérlés ────────────────────────────────────────
+    // user-volume: a kliens felhasználói gombokkal állítja (0-100)
+    // local-mute: a backend WS protokoll fordított targeting fallback-je
+    //             (ha a saját deviceId NINCS az unmutedDeviceIds listában)
+    // server-mute: a snapserver JSON-RPC Client.SetVolume-jából érkezik
+    //              (handleServerSettings)
+    // Effektív volume = (localMuted || serverMuted) ? 0 : userVolume.
+    @Volatile private var userVolume:  Int     = 100
+    @Volatile private var localMuted:  Boolean = true   // alapból néma (fail-safe)
+    @Volatile private var serverMuted: Boolean = true   // alapból néma
+    @Volatile private var serverVolume:Int     = 100
 
     @Volatile private var serverOffsetMs:    Long    = 0L
     @Volatile private var serverOffsetKnown: Boolean = false
@@ -68,8 +85,25 @@ class SnapcastClient(
         releaseAudioTrack()
     }
 
+    /** Felhasználói hangerő (0-100). Layereződik a mute logikával. */
     fun setVolume(volumePercent: Int) {
-        audioTrack?.setVolume(volumePercent / 100f)
+        userVolume = volumePercent.coerceIn(0, 100)
+        applyEffectiveVolume()
+    }
+
+    /** Backend-vezérelt lokális mute (WS protokoll fordított targeting fallback).
+     *  true → némítva (akár a user-volume is); false → user-volume érvényes. */
+    fun setLocalMute(muted: Boolean) {
+        if (localMuted == muted) return
+        localMuted = muted
+        applyEffectiveVolume()
+        Log.d(TAG, "localMute=$muted (effective vol applied)")
+    }
+
+    private fun applyEffectiveVolume() {
+        val muted = localMuted || serverMuted
+        val effective = if (muted) 0 else minOf(userVolume, serverVolume)
+        audioTrack?.setVolume(effective / 100f)
     }
 
     private suspend fun connectLoop() = withContext(Dispatchers.IO) {
@@ -105,15 +139,20 @@ class SnapcastClient(
     }
 
     private fun sendHello(out: OutputStream) {
+        // A backend snapcast-rpc.ts modulja a snap kliens `ID`, `config.name`
+        // vagy `host.name` mezőjét veti össze a backend device.id-jával,
+        // hogy célozni tudja a JSON-RPC mute/unmute műveletekkel. Ezért
+        // mindhárom mezőbe a deviceId-t tesszük (ha van).
+        val effectiveId = if (deviceId.isNotEmpty()) deviceId else "schoollive-android-unknown"
         val jsonStr   = JSONObject().apply {
             put("MAC",                       "00:00:00:00:00:00")
-            put("HostName",                  "schoollive-android")
+            put("HostName",                  effectiveId)
             put("Version",                   "0.26.0")
-            put("ClientName",                "SchoolLive Android")
+            put("ClientName",                effectiveId)
             put("OS",                        "Android")
             put("Arch",                      "arm")
             put("Instance",                  1)
-            put("ID",                        "schoollive-android-1")
+            put("ID",                        effectiveId)
             put("SnapStreamProtocolVersion", 2)
         }.toString()
         val jsonBytes = jsonStr.toByteArray(Charsets.UTF_8)
@@ -268,8 +307,13 @@ class SnapcastClient(
             val jsonLen = bb.int
             val json    = JSONObject(String(ByteArray(jsonLen).also { bb.get(it) }))
             val muted   = json.optBoolean("muted", false)
-            val volume  = json.optInt("volume", 100)
-            if (!muted) setVolume(volume)
+            val volume  = json.optInt("volume", 100).coerceIn(0, 100)
+            // A snapserver JSON-RPC Client.SetVolume-jából érkező mute-ot is
+            // alkalmazni kell, nem csak a hangerőt – ez a backend fordított
+            // targetingjének elsődleges layere.
+            serverMuted  = muted
+            serverVolume = volume
+            applyEffectiveVolume()
             Log.d(TAG, "ServerSettings: vol=$volume muted=$muted")
         } catch (e: Exception) {
             Log.w(TAG, "ServerSettings parse error: ${e.message}")
@@ -300,6 +344,10 @@ class SnapcastClient(
                 bufSize, AudioTrack.MODE_STREAM)
         }
         audioTrack?.play()
+        // Új AudioTrack alapból max volume-on van; alkalmazzuk az aktuális
+        // (user × local-mute × server-mute) effektív szintet, hogy a kliens
+        // ne kezdjen el rögtön hangosan szólni.
+        applyEffectiveVolume()
         Log.d(TAG, "AudioTrack ready: ${sampleRate}Hz buf=$bufSize")
     }
 

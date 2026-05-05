@@ -25,23 +25,40 @@ private val ISO_FORMAT = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale
 private fun isoNow(): String = synchronized(ISO_FORMAT) { ISO_FORMAT.format(Date()) }
 
 data class BellEvent(
-    val soundFile:  String,
-    val playAtMs:   Long,
-    val durationMs: Long?,
-    val snapActive: Boolean,
+    val soundFile:        String,
+    val playAtMs:         Long,
+    val durationMs:       Long?,
+    val snapActive:       Boolean,
+    /** A backend fordított targetingje. Ha üres VAGY a kliens device.id-ja
+     *  nincs benne, a snap kimenetet lokálisan némítani kell. */
+    val unmutedDeviceIds: List<String> = emptyList(),
 )
 
 data class TtsEvent(
-    val text:       String,
-    val playAtMs:   Long,
-    val durationMs: Long?,
-    val snapActive: Boolean,
+    val text:             String,
+    val playAtMs:         Long,
+    val durationMs:       Long?,
+    val snapActive:       Boolean,
+    val unmutedDeviceIds: List<String> = emptyList(),
 )
 
 data class RadioEvent(
-    val title:      String,
-    val snapActive: Boolean,
+    val title:            String,
+    val snapActive:       Boolean,
+    val unmutedDeviceIds: List<String> = emptyList(),
 )
+
+/** JSON Array → List<String>. */
+private fun jsonStringList(json: JSONObject, key: String): List<String> {
+    if (!json.has(key) || json.isNull(key)) return emptyList()
+    val arr = json.optJSONArray(key) ?: return emptyList()
+    val out = ArrayList<String>(arr.length())
+    for (i in 0 until arr.length()) {
+        val v = arr.optString(i, "")
+        if (v.isNotEmpty()) out.add(v)
+    }
+    return out
+}
 
 class SyncClient(
     private val wsUrl:          String,
@@ -175,9 +192,14 @@ class SyncClient(
                     }
                     val prepAction     = prepare.optString("action", "")
                     val prepSnapActive = prepare.optBoolean("snapcastActive", false)
+                    // A backend a fordított targetinghez `unmutedDeviceIds`-t ad át,
+                    // ami akár PLAY-ben akár PREPARE-ben érkezhet. PLAY-é felülírja
+                    // a PREPARE-be tárolt értéket, ha eltér.
+                    val unmuted = jsonStringList(json, "unmutedDeviceIds")
+                        .ifEmpty { jsonStringList(prepare, "unmutedDeviceIds") }
 
                     val diffMs = playAtMs - System.currentTimeMillis()
-                    Log.d(TAG, "PLAY: action=$prepAction diffMs=${diffMs}ms dur=${durationMs}ms")
+                    Log.d(TAG, "PLAY: action=$prepAction diffMs=${diffMs}ms dur=${durationMs}ms unmuted=${unmuted.size}")
 
                     if (diffMs < -10_000L) {
                         Log.w(TAG, "PLAY stale (${-diffMs}ms) → skip"); return
@@ -190,20 +212,23 @@ class SyncClient(
                         withContext(Dispatchers.Main) {
                             when (prepAction) {
                                 "BELL" -> onBell(BellEvent(
-                                    soundFile  = url.substringAfterLast("/"),
-                                    playAtMs   = playAtMs,
-                                    durationMs = durationMs,
-                                    snapActive = prepSnapActive,
+                                    soundFile        = url.substringAfterLast("/"),
+                                    playAtMs         = playAtMs,
+                                    durationMs       = durationMs,
+                                    snapActive       = prepSnapActive,
+                                    unmutedDeviceIds = unmuted,
                                 ))
                                 "TTS" -> onTts(TtsEvent(
-                                    text       = prepare.optString("text", ""),
-                                    playAtMs   = playAtMs,
-                                    durationMs = durationMs,
-                                    snapActive = prepSnapActive,
+                                    text             = prepare.optString("text", ""),
+                                    playAtMs         = playAtMs,
+                                    durationMs       = durationMs,
+                                    snapActive       = prepSnapActive,
+                                    unmutedDeviceIds = unmuted,
                                 ))
                                 "PLAY_URL" -> onRadio(RadioEvent(
-                                    title      = prepare.optString("title", "Iskolarádió"),
-                                    snapActive = prepSnapActive,
+                                    title            = prepare.optString("title", "Iskolarádió"),
+                                    snapActive       = prepSnapActive,
+                                    unmutedDeviceIds = unmuted,
                                 ))
                             }
                         }
@@ -213,24 +238,28 @@ class SyncClient(
                 // ── Azonnali broadcast ────────────────────────────────────────
                 action.isNotEmpty() && phase.isEmpty() -> {
                     val durationMs = if (json.has("durationMs")) json.getLong("durationMs") else null
-                    Log.d(TAG, "Broadcast: action=$action snap=$snapActive dur=$durationMs")
+                    val unmuted = jsonStringList(json, "unmutedDeviceIds")
+                    Log.d(TAG, "Broadcast: action=$action snap=$snapActive dur=$durationMs unmuted=${unmuted.size}")
                     scope.launch(Dispatchers.Main) {
                         when (action) {
                             "BELL" -> onBell(BellEvent(
-                                soundFile  = json.optString("url","").substringAfterLast("/"),
-                                playAtMs   = System.currentTimeMillis(),
-                                durationMs = durationMs,
-                                snapActive = snapActive,
+                                soundFile        = json.optString("url","").substringAfterLast("/"),
+                                playAtMs         = System.currentTimeMillis(),
+                                durationMs       = durationMs,
+                                snapActive       = snapActive,
+                                unmutedDeviceIds = unmuted,
                             ))
                             "TTS" -> onTts(TtsEvent(
-                                text       = json.optString("text", ""),
-                                playAtMs   = System.currentTimeMillis(),
-                                durationMs = durationMs,
-                                snapActive = snapActive,
+                                text             = json.optString("text", ""),
+                                playAtMs         = System.currentTimeMillis(),
+                                durationMs       = durationMs,
+                                snapActive       = snapActive,
+                                unmutedDeviceIds = unmuted,
                             ))
                             "PLAY_URL" -> onRadio(RadioEvent(
-                                title      = json.optString("title", "Iskolarádió"),
-                                snapActive = snapActive,
+                                title            = json.optString("title", "Iskolarádió"),
+                                snapActive       = snapActive,
+                                unmutedDeviceIds = unmuted,
                             ))
                             "STOP_PLAYBACK" -> onStop()
 

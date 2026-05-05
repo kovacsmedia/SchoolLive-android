@@ -39,6 +39,10 @@ class PlayerService : Service() {
     private var syncClient: SyncClient?     = null
     private var bellManager: BellManager?   = null
 
+    // Aktuális automatikus re-mute job (durationMs lejárta után visszanémítja
+    // a snap kimenetet a háttér-állapotba). Új lejátszás indítása lemondja.
+    private var remuteJob: Job? = null
+
     var snapConnected = false; private set
     var wsConnected   = false; private set
 
@@ -111,6 +115,7 @@ class PlayerService : Service() {
             snapClient = SnapcastClient(
                 host = host,
                 port = port,
+                deviceId = PrefsUtil.getDeviceId(ctx),
                 onConnected = {
                     snapConnected = true
                     bellManager?.onSnapConnected()
@@ -145,12 +150,25 @@ class PlayerService : Service() {
 
                 onBell = { event ->
                     bellManager?.registerBell()
+                    applyTargeting(event.unmutedDeviceIds, event.durationMs)
                     onBell?.invoke(event)
                 },
 
-                onTts   = { event -> onTts?.invoke(event) },
-                onRadio = { event -> onRadio?.invoke(event) },
-                onStop  = { onStop?.invoke() },
+                onTts   = { event ->
+                    applyTargeting(event.unmutedDeviceIds, event.durationMs)
+                    onTts?.invoke(event)
+                },
+                onRadio = { event ->
+                    // Rádiónál nincs durationMs → STOP_PLAYBACK-ig unmuted marad
+                    applyTargeting(event.unmutedDeviceIds, null)
+                    onRadio?.invoke(event)
+                },
+                onStop  = {
+                    // Lejátszás vége → minden esetben visszanémítjuk a snap kimenetet.
+                    remuteJob?.cancel(); remuteJob = null
+                    snapClient?.setLocalMute(true)
+                    onStop?.invoke()
+                },
                 onSyncBells = { scope.launch { refreshBells() } },
                 onConnected = {
                     wsConnected = true
@@ -170,6 +188,43 @@ class PlayerService : Service() {
     }
 
     fun setVolume(percent: Int) { snapClient?.setVolume(percent) }
+
+    /** Backend fordított targetingjének lokális fallbackje.
+     *
+     *  A snap stream alapból néma (localMuted = true). Ha a kliens benne van
+     *  az `unmutedDeviceIds` listában, oldjuk a némítást a lejátszás idejére.
+     *  Ha durationMs ismert (BELL/TTS), automatikusan visszanémítjuk; rádiónál
+     *  STOP_PLAYBACK-ig nyitva marad. */
+    private fun applyTargeting(unmutedDeviceIds: List<String>, durationMs: Long?) {
+        val myId = PrefsUtil.getDeviceId(applicationContext)
+        val sc   = snapClient ?: return
+        val unmuted = myId.isNotEmpty() && unmutedDeviceIds.contains(myId)
+
+        // Bármi is történik, az előző auto-remute timert lemondjuk.
+        remuteJob?.cancel(); remuteJob = null
+
+        if (!unmuted) {
+            // Nem vagyunk célzottak → maradjon/legyen néma a snap output.
+            sc.setLocalMute(true)
+            Log.d(TAG, "Targeting: NEM célzott (myId=$myId), snap localMuted=true")
+            return
+        }
+
+        sc.setLocalMute(false)
+        Log.d(TAG, "Targeting: célzott (myId=$myId), snap localMuted=false, dur=$durationMs")
+
+        // Auto-remute durationMs lejártakor.
+        durationMs?.let { dur ->
+            if (dur > 0) {
+                remuteJob = scope.launch {
+                    // Egy kis biztonsági margó, hogy a lejátszás teljesen befejeződjön.
+                    delay(dur + 500L)
+                    snapClient?.setLocalMute(true)
+                    Log.d(TAG, "Auto-remute durationMs (${dur}ms) lejárt")
+                }
+            }
+        }
+    }
 
     // ── Beacon ────────────────────────────────────────────────────────────────
 
@@ -195,6 +250,13 @@ class PlayerService : Service() {
                         Log.w(TAG, "Beacon 401 – deaktiválva")
                         withContext(Dispatchers.Main) { resetToProvisioning() }
                         return
+                    }
+                    // Backend által visszaadott deviceId perzisztálása.
+                    // Ezt használja a snap HELLO `ID` és az unmutedDeviceIds fallback.
+                    val newId = resp.body()?.deviceId
+                    if (!newId.isNullOrEmpty() && PrefsUtil.getDeviceId(ctx) != newId) {
+                        PrefsUtil.setDeviceId(ctx, newId)
+                        Log.d(TAG, "DeviceId persisted from beacon: $newId")
                     }
                 }
             } catch (e: Exception) {

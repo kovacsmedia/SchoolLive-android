@@ -21,6 +21,13 @@ object PrefsUtil {
     fun getDeviceKey(ctx: Context) = prefs(ctx).getString("device_key", "") ?: ""
     fun setDeviceKey(ctx: Context, v: String) = prefs(ctx).edit().putString("device_key", v).apply()
 
+    // ── Device ID (UUID, backend-által generált) ───────────────────
+    // A snap HELLO ID-jánál és a fordított targeting (unmutedDeviceIds)
+    // lokális ellenőrzésénél használjuk. A beacon/tenant-info válaszából
+    // perzisztáljuk.
+    fun getDeviceId(ctx: Context) = prefs(ctx).getString("device_id", "") ?: ""
+    fun setDeviceId(ctx: Context, v: String) = prefs(ctx).edit().putString("device_id", v).apply()
+
     fun getHardwareId(ctx: Context) = prefs(ctx).getString("hardware_id", "") ?: ""
     fun setHardwareId(ctx: Context, v: String) = prefs(ctx).edit().putString("hardware_id", v).apply()
 

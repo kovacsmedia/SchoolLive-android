@@ -344,10 +344,16 @@ class MainActivity : AppCompatActivity() {
             try {
                 val resp = ApiClient.get(serverUrl).getTenantInfo(deviceKey)
                 if (resp.isSuccessful) {
-                    val name = resp.body()?.tenantName
+                    val body = resp.body()
+                    val name = body?.tenantName
                     if (!name.isNullOrEmpty()) {
                         withContext(Dispatchers.Main) { binding.tvTenantName.text = name }
                         PrefsUtil.setDeviceName(this@MainActivity, name)
+                    }
+                    // DeviceId perzisztálás (snap HELLO + unmute fallback miatt)
+                    val devId = body?.deviceId
+                    if (!devId.isNullOrEmpty() && PrefsUtil.getDeviceId(this@MainActivity) != devId) {
+                        PrefsUtil.setDeviceId(this@MainActivity, devId)
                     }
                 }
             } catch (_: Exception) {}
