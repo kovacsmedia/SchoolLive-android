@@ -278,34 +278,35 @@ class SnapcastClient(
     }
 
     private suspend fun playbackLoop() = withContext(Dispatchers.IO) {
+        val prebufferChunks = 25 // 25 × 20 ms ≈ 500 ms
+
         while (running) {
             val track = audioTrack
-            if (track == null || !isConnected) { delay(20); continue }
-            if (!serverOffsetKnown) { delay(10); continue }
 
-            val chunk = audioQueue.poll() ?: run { delay(5); return@run null } ?: continue
+            if (track == null || !isConnected) {
+                delay(20)
+                continue
+            }
 
-            val nowMs         = System.currentTimeMillis()
-            val localPlayAtMs = chunk.serverTimestampMs - serverOffsetMs + TARGET_BUFFER_MS
-            val diffMs        = localPlayAtMs - nowMs
+            // Várunk, amíg összegyűlik kb. fél másodperc hang.
+            // Ez kisimítja a hálózati/coroutine időzítési ingadozásokat.
+            if (audioQueue.size < prebufferChunks) {
+                delay(10)
+                continue
+            }
 
-            when {
-                diffMs > 500                -> {
-                    audioQueue.offer(chunk)
-                    delay(minOf(diffMs - 200, 100))
-                }
-                diffMs < -STALE_THRESHOLD_MS -> {
-                    Log.v(TAG, "Dropping stale chunk (${-diffMs}ms late)")
-                }
-                diffMs in 0..500            -> {
-                    if (diffMs > 0) delay(diffMs)
-                    track.write(chunk.pcm, 0, chunk.pcm.size)
-                }
-                else                        -> {
-                    track.write(chunk.pcm, 0, chunk.pcm.size)
-                }
+            val chunk = audioQueue.poll()
+            if (chunk == null) {
+                delay(5)
+                continue
+            }
+
+            val written = track.write(chunk.pcm, 0, chunk.pcm.size)
+            if (written < 0) {
+                Log.w(TAG, "AudioTrack write error: $written")
             }
         }
+
     }
 
     private fun handleServerSettings(payload: ByteArray) {
