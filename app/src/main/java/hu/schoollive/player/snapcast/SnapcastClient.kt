@@ -277,36 +277,48 @@ class SnapcastClient(
     }
 
     private suspend fun playbackLoop() = withContext(Dispatchers.IO) {
-        val prebufferChunks = 50       // 50 × 20 ms ≈ 1000 ms
-        val writeBlockChunks = 10      // 10 × 20 ms ≈ 200 ms
+        val prebufferChunks = 50       // kb. 1000 ms
+        val writeBlockChunks = 10      // kb. 200 ms
+        var buffered = false
 
         while (running) {
             val track = audioTrack
 
             if (track == null || !isConnected) {
+                buffered = false
                 delay(20)
                 continue
             }
 
-            // Indulás előtt kb. 1 másodperc puffert gyűjtünk.
-            // Nekünk most nem kell ms-pontos sync, elég 1s-on belül maradni.
-            if (audioQueue.size < prebufferChunks) {
-                delay(10)
-                continue
-            }
+            // Csak induláskor vagy underrun után várunk nagyobb puffert.
+            if (!buffered) {
+                if (audioQueue.size < prebufferChunks) {
+                    delay(10)
+                    continue
+                }
 
-            val first = audioQueue.poll()
-            if (first == null) {
-                delay(5)
-                continue
+                Log.i(TAG, "Audio prebuffer ready: ${audioQueue.size} chunks")
+                buffered = true
             }
 
             val block = ArrayList<ByteArray>(writeBlockChunks)
-            block.add(first.pcm)
 
             while (block.size < writeBlockChunks) {
-                val next = audioQueue.poll() ?: break
-                block.add(next.pcm)
+                val chunk = audioQueue.poll()
+
+                if (chunk == null) {
+                    // Elfogyott a puffer: újrapufferelünk.
+                    Log.w(TAG, "Audio underrun, rebuffering")
+                    buffered = false
+                    break
+                }
+
+                block.add(chunk.pcm)
+            }
+
+            if (block.isEmpty()) {
+                delay(5)
+                continue
             }
 
             val totalSize = block.sumOf { it.size }
@@ -319,37 +331,32 @@ class SnapcastClient(
             }
 
             val written = track.write(mergedPcm, 0, mergedPcm.size)
+
             if (written < 0) {
                 Log.w(TAG, "AudioTrack write error: $written")
+                buffered = false
             }
         }
     }
-
     private fun handleServerSettings(payload: ByteArray) {
         try {
-            val bb      = ByteBuffer.wrap(payload).order(ByteOrder.LITTLE_ENDIAN)
+            val bb = ByteBuffer.wrap(payload).order(ByteOrder.LITTLE_ENDIAN)
             val jsonLen = bb.int
-            val json    = JSONObject(String(ByteArray(jsonLen).also { bb.get(it) }))
-            val muted   = json.optBoolean("muted", false)
-            val volume  = json.optInt("volume", 100).coerceIn(0, 100)
-            // FONTOS: a snap szerver tárolja a per-kliens muted állapotot, és a
-            // korábbi backend kód muteAll()-t hívott minden lejátszás után.
-            // Ezért a snap szerver minden csatlakozáskor muted=true-t küld,
-            // ami elnémítja az AudioTrack-et. A backendes RPC unmute nem mindig
-            // fut le időben. Ezért a snap szerver oldali `muted` flaget szándékosan
-            // FIGYELMEN KÍVÜL HAGYJUK – a hangerőt (volume %) alkalmazzuk, de a
-            // mute-ot NEM. A némutatást kizárólag a WS targetingből érkező
-            // localMuted logika végzi.
-            //
-            // serverMuted = muted   ← szándékosan ki van kommentelve
+            val json = JSONObject(String(ByteArray(jsonLen).also { bb.get(it) }))
+
+            val muted = json.optBoolean("muted", false)
+            val volume = json.optInt("volume", 100).coerceIn(0, 100)
+
+            // A snapserver muted flagjét továbbra sem alkalmazzuk közvetlenül,
+            // mert a célzott némítást a localMuted logika kezeli.
             serverVolume = volume
             applyEffectiveVolume()
+
             Log.d(TAG, "ServerSettings: vol=$volume muted=$muted (muted flag ignored)")
         } catch (e: Exception) {
             Log.w(TAG, "ServerSettings parse error: ${e.message}")
         }
     }
-
     @Suppress("DEPRECATION")
     private fun initAudioTrack() {
         releaseAudioTrack()
