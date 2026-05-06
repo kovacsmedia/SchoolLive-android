@@ -387,18 +387,23 @@ class SnapcastClient(
     }
 
     private fun handleWireChunk(payload: ByteArray) {
-        if (payload.size <= 8) return
+        if (payload.size <= 12) return
 
-        val bb = ByteBuffer.wrap(payload, 0, 8).order(ByteOrder.LITTLE_ENDIAN)
+        val bb = ByteBuffer.wrap(payload).order(ByteOrder.LITTLE_ENDIAN)
 
         val sec = bb.int.toLong()
         val us = bb.int.toLong()
+        val size = bb.int
+
+        if (size <= 0) return
+        if (payload.size < 12 + size) {
+            Log.w(TAG, "WireChunk too short: payload=${payload.size}, declaredPcmSize=$size")
+            return
+        }
 
         val serverTimestampMs = sec * 1000L + us / 1000L
-        val pcm = payload.copyOfRange(8, payload.size)
+        val pcm = payload.copyOfRange(12, 12 + size)
 
-        // Ha a queue megtelik, a legrégebbi chunkot dobjuk.
-        // Ez jobb, mint a végtelen késésnövekedés.
         if (audioQueue.remainingCapacity() == 0) {
             audioQueue.poll()
         }
@@ -407,7 +412,6 @@ class SnapcastClient(
 
         onActivity()
     }
-
     /**
      * Stabil, nem ms-pontos Snapcast lejátszás.
      *
