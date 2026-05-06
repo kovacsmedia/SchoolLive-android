@@ -480,8 +480,7 @@ class SnapcastClient(
             val chunk = audioQueue.poll()
 
             if (chunk == null) {
-                synced = false
-                delay(5)
+                delay(2)
                 continue
             }
 
