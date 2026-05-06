@@ -269,56 +269,16 @@ class SnapcastClient(
         val us  = bb.int.toLong()
         val serverTimestampMs = sec * 1000L + us / 1000L
         val pcm = payload.copyOfRange(8, payload.size)
-        smoothChunkEdgesInPlace(pcm)
         if (audioQueue.remainingCapacity() == 0) audioQueue.poll()
         audioQueue.offer(AudioChunk(pcm, serverTimestampMs))
 
         // Snap LED pulse – minden beérkező chunk aktivitást jelez
         onActivity()
     }
-    private fun smoothChunkEdgesInPlace(pcm: ByteArray) {
-        // Csak 16 bites PCM-re alkalmazzuk.
-        if (encoding != AudioFormat.ENCODING_PCM_16BIT) return
 
-        // 48 kHz stereo 16-bit esetén 1 frame = 4 byte.
-        val frameSize = if (channels == AudioFormat.CHANNEL_OUT_STEREO) 4 else 2
-        if (pcm.size < frameSize * 32) return
-
-        // 24 frame kb. 0,5 ms 48 kHz-en.
-        // Ez elég rövid ahhoz, hogy ne legyen hallható "fade",
-        // de elég hosszú a chunkhatár-kattanások tompítására.
-        val fadeFrames = 24.coerceAtMost(pcm.size / frameSize / 2)
-
-        fun getSample(offset: Int): Int {
-            return (pcm[offset].toInt() and 0xFF) or (pcm[offset + 1].toInt() shl 8)
-        }
-
-        fun putSample(offset: Int, value: Int) {
-            val v = value.coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt())
-            pcm[offset] = (v and 0xFF).toByte()
-            pcm[offset + 1] = ((v shr 8) and 0xFF).toByte()
-        }
-
-        for (i in 0 until fadeFrames) {
-            val factorIn = i.toFloat() / fadeFrames.toFloat()
-            val factorOut = (fadeFrames - i).toFloat() / fadeFrames.toFloat()
-
-            val startFrameOffset = i * frameSize
-            val endFrameOffset = pcm.size - ((i + 1) * frameSize)
-
-            // Bal / mono csatorna
-            putSample(startFrameOffset, (getSample(startFrameOffset) * factorIn).toInt())
-            putSample(endFrameOffset, (getSample(endFrameOffset) * factorOut).toInt())
-
-            // Jobb csatorna, ha stereo
-            if (frameSize == 4) {
-                putSample(startFrameOffset + 2, (getSample(startFrameOffset + 2) * factorIn).toInt())
-                putSample(endFrameOffset + 2, (getSample(endFrameOffset + 2) * factorOut).toInt())
-            }
-        }
-    }
     private suspend fun playbackLoop() = withContext(Dispatchers.IO) {
-        val prebufferChunks = 25 // 25 × 20 ms ≈ 500 ms
+        val prebufferChunks = 50       // 50 × 20 ms ≈ 1000 ms
+        val writeBlockChunks = 10      // 10 × 20 ms ≈ 200 ms
 
         while (running) {
             val track = audioTrack
@@ -328,25 +288,41 @@ class SnapcastClient(
                 continue
             }
 
-            // Várunk, amíg összegyűlik kb. fél másodperc hang.
-            // Ez kisimítja a hálózati/coroutine időzítési ingadozásokat.
+            // Indulás előtt kb. 1 másodperc puffert gyűjtünk.
+            // Nekünk most nem kell ms-pontos sync, elég 1s-on belül maradni.
             if (audioQueue.size < prebufferChunks) {
                 delay(10)
                 continue
             }
 
-            val chunk = audioQueue.poll()
-            if (chunk == null) {
+            val first = audioQueue.poll()
+            if (first == null) {
                 delay(5)
                 continue
             }
 
-            val written = track.write(chunk.pcm, 0, chunk.pcm.size)
+            val block = ArrayList<ByteArray>(writeBlockChunks)
+            block.add(first.pcm)
+
+            while (block.size < writeBlockChunks) {
+                val next = audioQueue.poll() ?: break
+                block.add(next.pcm)
+            }
+
+            val totalSize = block.sumOf { it.size }
+            val mergedPcm = ByteArray(totalSize)
+
+            var offset = 0
+            for (pcm in block) {
+                pcm.copyInto(mergedPcm, offset)
+                offset += pcm.size
+            }
+
+            val written = track.write(mergedPcm, 0, mergedPcm.size)
             if (written < 0) {
                 Log.w(TAG, "AudioTrack write error: $written")
             }
         }
-
     }
 
     private fun handleServerSettings(payload: ByteArray) {
