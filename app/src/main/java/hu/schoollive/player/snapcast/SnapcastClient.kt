@@ -451,7 +451,7 @@ class SnapcastClient(
      * - a kisebb driftet az AudioTrack folyamatos pufferelése elfedi.
      */
     private suspend fun playbackLoop() = withContext(Dispatchers.IO) {
-        val targetLatencyMs = 700L
+        val targetLatencyMs = 1200L
         val initialPrebufferChunks = 10 // kb. 200 ms, ha 20 ms/chunk
 
         var synced = false

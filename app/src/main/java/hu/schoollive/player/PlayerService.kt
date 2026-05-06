@@ -229,9 +229,9 @@ class PlayerService : Service() {
             if (dur > 0) {
                 remuteJob = scope.launch {
                     // Egy kis biztonsági margó, hogy a lejátszás teljesen befejeződjön.
-                    delay(dur + 500L)
+                    delay(dur + 3000L)
                     snapClient?.setLocalMute(true)
-                    Log.d(TAG, "Auto-remute durationMs (${dur}ms) lejárt")
+                    Log.d(TAG, "Auto-remute durationMs (${dur}ms + safety) lejárt")
                 }
             }
         }
