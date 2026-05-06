@@ -41,19 +41,15 @@ class SnapcastClient(
     private val port: Int,
 
     /**
-     * A backend device.id, amelyet a snap HELLO `ID` mezőben elküldünk.
-     * Ez teszi lehetővé, hogy a backend JSON-RPC-vel célozza ezt a klienst
-     * Client.SetVolume per-device mute/unmute műveletekhez.
+     * Backend device.id.
      *
-     * Ha üres, fallback a régi "schoollive-android" konstansra.
+     * Ezt küldjük a snap HELLO `ID` mezőben.
+     * Így tudja a backend célzottan némítani / engedélyezni az eszközt.
      */
     private val deviceId: String = "",
 
     private val onConnected: () -> Unit = {},
     private val onDisconnected: () -> Unit = {},
-
-    // Snap LED pulse trigger – minden audio chunk beérkezésekor hívódik.
-    // A MainActivity ebből pulzáltatja az indicatorSnap LED-et.
     private val onActivity: () -> Unit = {},
 ) {
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -72,16 +68,8 @@ class SnapcastClient(
     private var encoding = AudioFormat.ENCODING_PCM_16BIT
     private var bytesPerMs = 192
 
-    // ── Két-rétegű volume vezérlés ────────────────────────────────────────
-    //
-    // user-volume: a kliens felhasználói gombokkal állítja (0-100)
-    // local-mute: a backend WS protokoll fordított targeting fallback-je
-    // server-mute: a snapserver JSON-RPC Client.SetVolume-jából érkezne
-    //
-    // FONTOS:
-    // A mute alapértelmezése FALSE.
-    // A mute csak akkor aktiválódik, ha a targeting logika biztosan tudja,
-    // hogy ez az eszköz nincs megcélozva.
+    // ── Volume / mute állapot ─────────────────────────────────────────────
+
     @Volatile
     private var userVolume: Int = 100
 
@@ -94,6 +82,8 @@ class SnapcastClient(
     @Volatile
     private var serverVolume: Int = 100
 
+    // ── Snap time sync ────────────────────────────────────────────────────
+
     @Volatile
     private var serverOffsetMs: Long = 0L
 
@@ -103,7 +93,7 @@ class SnapcastClient(
     @Volatile
     private var timeSentLocalMs: Long = 0L
 
-    private val audioQueue = ArrayBlockingQueue<AudioChunk>(300)
+    private val audioQueue = ArrayBlockingQueue<AudioChunk>(500)
 
     fun start() {
         if (running) return
@@ -126,21 +116,11 @@ class SnapcastClient(
         releaseAudioTrack()
     }
 
-    /**
-     * Felhasználói hangerő (0-100).
-     * Layereződik a mute logikával.
-     */
     fun setVolume(volumePercent: Int) {
         userVolume = volumePercent.coerceIn(0, 100)
         applyEffectiveVolume()
     }
 
-    /**
-     * Backend-vezérelt lokális mute.
-     *
-     * true  → némítva
-     * false → user-volume érvényes
-     */
     fun setLocalMute(muted: Boolean) {
         if (localMuted == muted) return
 
@@ -157,12 +137,16 @@ class SnapcastClient(
         audioTrack?.setVolume(effective / 100f)
     }
 
+    // ── Kapcsolódás ───────────────────────────────────────────────────────
+
     private suspend fun connectLoop() = withContext(Dispatchers.IO) {
         while (running) {
+            var socket: Socket? = null
+
             try {
                 Log.d(TAG, "Connecting to $host:$port")
 
-                val socket = Socket(host, port)
+                socket = Socket(host, port)
                 socket.tcpNoDelay = true
 
                 val out = socket.getOutputStream()
@@ -170,7 +154,6 @@ class SnapcastClient(
 
                 serverOffsetKnown = false
                 serverOffsetMs = 0L
-
                 audioQueue.clear()
 
                 sendHello(out)
@@ -190,6 +173,11 @@ class SnapcastClient(
                     Log.w(TAG, "Connection lost: ${e.message}")
                 }
             } finally {
+                try {
+                    socket?.close()
+                } catch (_: Exception) {
+                }
+
                 isConnected = false
                 serverOffsetKnown = false
                 audioQueue.clear()
@@ -227,6 +215,7 @@ class SnapcastClient(
         val jsonBytes = jsonStr.toByteArray(Charsets.UTF_8)
 
         val payload = ByteArray(4 + jsonBytes.size)
+
         ByteBuffer.wrap(payload)
             .order(ByteOrder.LITTLE_ENDIAN)
             .putInt(jsonBytes.size)
@@ -275,6 +264,8 @@ class SnapcastClient(
             .array()
     }
 
+    // ── Snap protokoll olvasás ────────────────────────────────────────────
+
     private fun readLoop(input: InputStream, output: OutputStream) {
         val headerBuf = ByteArray(26)
 
@@ -297,6 +288,7 @@ class SnapcastClient(
             val size = bb.int
 
             val payload = ByteArray(size)
+
             if (size > 0 && readFully(input, payload) == null) {
                 break
             }
@@ -315,6 +307,7 @@ class SnapcastClient(
 
         while (offset < buf.size) {
             val n = input.read(buf, offset, buf.size - offset)
+
             if (n < 0) return null
 
             offset += n
@@ -336,128 +329,234 @@ class SnapcastClient(
     }
 
     private fun handleCodecHeader(payload: ByteArray) {
-        val bb = ByteBuffer.wrap(payload).order(ByteOrder.LITTLE_ENDIAN)
+        try {
+            val bb = ByteBuffer.wrap(payload).order(ByteOrder.LITTLE_ENDIAN)
 
-        val nameLen = bb.int
-        val codec = String(ByteArray(nameLen).also { bb.get(it) })
+            val nameLen = bb.int
 
-        Log.d(TAG, "Codec: $codec")
-
-        if (codec.lowercase() == "pcm" && bb.remaining() >= 16) {
-            val headerSize = bb.int
-
-            if (headerSize >= 28) {
-                bb.int
-                bb.int
-                bb.int
-                bb.int
-                bb.int
-
-                bb.short
-
-                val ch = bb.short.toInt() and 0xFFFF
-                val rate = bb.int
-
-                bb.int
-                bb.short
-
-                val bits = bb.short.toInt() and 0xFFFF
-
-                sampleRate = rate
-                channels = if (ch == 2) {
-                    AudioFormat.CHANNEL_OUT_STEREO
-                } else {
-                    AudioFormat.CHANNEL_OUT_MONO
-                }
-
-                encoding = if (bits == 16) {
-                    AudioFormat.ENCODING_PCM_16BIT
-                } else {
-                    AudioFormat.ENCODING_PCM_8BIT
-                }
-
-                bytesPerMs = (rate * ch * if (bits == 16) 2 else 1) / 1000
-
-                Log.d(TAG, "PCM: ${ch}ch ${bits}bit ${rate}Hz → $bytesPerMs bytes/ms")
+            if (nameLen <= 0 || nameLen > bb.remaining()) {
+                Log.w(TAG, "Invalid codec name length: $nameLen")
+                return
             }
-        }
 
-        audioQueue.clear()
-        initAudioTrack()
+            val codec = String(ByteArray(nameLen).also { bb.get(it) })
+
+            Log.d(TAG, "Codec: $codec")
+
+            if (codec.lowercase() == "pcm" && bb.remaining() >= 16) {
+                val headerSize = bb.int
+
+                if (headerSize >= 28 && bb.remaining() >= 28) {
+                    bb.int
+                    bb.int
+                    bb.int
+                    bb.int
+                    bb.int
+
+                    bb.short
+
+                    val ch = bb.short.toInt() and 0xFFFF
+                    val rate = bb.int
+
+                    bb.int
+                    bb.short
+
+                    val bits = bb.short.toInt() and 0xFFFF
+
+                    sampleRate = rate
+
+                    channels = if (ch == 2) {
+                        AudioFormat.CHANNEL_OUT_STEREO
+                    } else {
+                        AudioFormat.CHANNEL_OUT_MONO
+                    }
+
+                    encoding = if (bits == 16) {
+                        AudioFormat.ENCODING_PCM_16BIT
+                    } else {
+                        AudioFormat.ENCODING_PCM_8BIT
+                    }
+
+                    bytesPerMs = (rate * ch * if (bits == 16) 2 else 1) / 1000
+
+                    Log.d(TAG, "PCM: ${ch}ch ${bits}bit ${rate}Hz → $bytesPerMs bytes/ms")
+                }
+            }
+
+            audioQueue.clear()
+            initAudioTrack()
+        } catch (e: Exception) {
+            Log.w(TAG, "CodecHeader parse error: ${e.message}")
+        }
     }
 
+    /**
+     * Fontos javítás:
+     *
+     * A Snapcast WireChunk payload szerkezete:
+     *
+     *   int32 sec
+     *   int32 usec
+     *   int32 pcmSize
+     *   byte[] pcm
+     *
+     * Tehát a PCM nem a 8. bájttól indul, hanem a 12. bájttól.
+     * Ha a size mezőt PCM-ként játsszuk le, az minden chunk elején kattanást,
+     * zajt, 50 Hz-es hibát okoz.
+     */
     private fun handleWireChunk(payload: ByteArray) {
         if (payload.size <= 12) return
 
-        val bb = ByteBuffer.wrap(payload).order(ByteOrder.LITTLE_ENDIAN)
+        try {
+            val bb = ByteBuffer.wrap(payload).order(ByteOrder.LITTLE_ENDIAN)
 
-        val sec = bb.int.toLong()
-        val us = bb.int.toLong()
-        val size = bb.int
+            val sec = bb.int.toLong()
+            val us = bb.int.toLong()
+            val pcmSize = bb.int
 
-        if (size <= 0) return
-        if (payload.size < 12 + size) {
-            Log.w(TAG, "WireChunk too short: payload=${payload.size}, declaredPcmSize=$size")
-            return
+            if (pcmSize <= 0) return
+
+            if (payload.size < 12 + pcmSize) {
+                Log.w(
+                    TAG,
+                    "WireChunk too short: payload=${payload.size}, declaredPcmSize=$pcmSize"
+                )
+                return
+            }
+
+            val serverTimestampMs = sec * 1000L + us / 1000L
+            val pcm = payload.copyOfRange(12, 12 + pcmSize)
+
+            // Ha megtelik a queue, eldobjuk a legrégebbit.
+            // Így nem nő végtelenül a késés.
+            if (audioQueue.remainingCapacity() == 0) {
+                audioQueue.poll()
+            }
+
+            audioQueue.offer(AudioChunk(pcm, serverTimestampMs))
+
+            onActivity()
+        } catch (e: Exception) {
+            Log.w(TAG, "WireChunk parse error: ${e.message}")
         }
-
-        val serverTimestampMs = sec * 1000L + us / 1000L
-        val pcm = payload.copyOfRange(12, 12 + size)
-
-        if (audioQueue.remainingCapacity() == 0) {
-            audioQueue.poll()
-        }
-
-        audioQueue.offer(AudioChunk(pcm, serverTimestampMs))
-
-        onActivity()
     }
+
     /**
-     * Stabil, nem ms-pontos Snapcast lejátszás.
+     * Szinkronizált lejátszás.
      *
-     * A korábbi hiba oka az volt, hogy a kliens minden 20 ms-os chunkot
-     * külön időzített, illetve újra és újra prebufferre várt.
+     * Nem a 20 ms-os chunkokat időzítjük vakon.
+     * Ehelyett:
      *
-     * Itt csak induláskor vagy underrun után várunk előpufferre.
-     * Utána folyamatosan etetjük az AudioTrack-et.
+     * - a Snapcast timestamp megmondja, hogy a chunk szerveridő szerint hová tartozik;
+     * - az AudioTrack playbackHeadPosition megmondja, hogy az Android ténylegesen hol tart;
+     * - ehhez igazítjuk a várakozást / dobást / resetet.
      */
     private suspend fun playbackLoop() = withContext(Dispatchers.IO) {
-        val prebufferChunks = 50 // kb. 1000 ms
-        var buffered = false
+        val targetLatencyMs = 300L
+
+        // Ha ennél később érkezik egy chunk, inkább eldobjuk,
+        // különben a késés folyamatosan nőne.
+        val maxLateMs = 120L
+
+        // Ha ennyire túl korainak tűnik, akkor valószínűleg sync reset kell.
+        val maxEarlyMs = 800L
+
+        var syncBaseServerMs: Long? = null
+        var syncBasePlaybackFrames: Long = 0L
+
+        fun playbackFrames64(track: AudioTrack): Long {
+            // API 21 kompatibilis.
+            // Rövid iskolai üzeneteknél nem várható 32 bites wraparound.
+            return track.playbackHeadPosition.toLong() and 0xFFFFFFFFL
+        }
+
+        fun playedMsSinceBase(track: AudioTrack): Long {
+            val baseServer = syncBaseServerMs ?: return 0L
+
+            val nowFrames = playbackFrames64(track)
+            val frames = nowFrames - syncBasePlaybackFrames
+
+            return if (frames <= 0) {
+                0L
+            } else {
+                (frames * 1000L) / sampleRate
+            }
+        }
 
         while (running) {
             val track = audioTrack
 
             if (track == null || !isConnected) {
-                buffered = false
+                syncBaseServerMs = null
                 delay(20)
                 continue
             }
 
-            if (!buffered) {
-                if (audioQueue.size < prebufferChunks) {
-                    delay(10)
-                    continue
-                }
-
-                Log.i(TAG, "Audio prebuffer ready: ${audioQueue.size} chunks")
-                buffered = true
+            if (!serverOffsetKnown) {
+                delay(10)
+                continue
             }
 
             val chunk = audioQueue.poll()
 
             if (chunk == null) {
-                Log.w(TAG, "Audio underrun, rebuffering")
-                buffered = false
-                delay(10)
+                delay(5)
                 continue
+            }
+
+            val base = syncBaseServerMs
+
+            if (base == null) {
+                // Első chunk ehhez képest lesz a sync alap.
+                syncBaseServerMs = chunk.serverTimestampMs
+                syncBasePlaybackFrames = playbackFrames64(track)
+
+                val localServerNowMs = System.currentTimeMillis() + serverOffsetMs
+                val desiredStartMs = chunk.serverTimestampMs + targetLatencyMs
+                val waitMs = desiredStartMs - localServerNowMs
+
+                if (waitMs > 0) {
+                    delay(waitMs.coerceAtMost(targetLatencyMs))
+                }
+
+                val written = track.write(chunk.pcm, 0, chunk.pcm.size)
+
+                if (written < 0) {
+                    Log.w(TAG, "AudioTrack write error: $written")
+                    syncBaseServerMs = null
+                }
+
+                continue
+            }
+
+            val expectedServerPlaybackMs = base + playedMsSinceBase(track)
+            val desiredChunkPlaybackMs = chunk.serverTimestampMs + targetLatencyMs
+            val diffMs = desiredChunkPlaybackMs - expectedServerPlaybackMs
+
+            when {
+                diffMs < -maxLateMs -> {
+                    Log.w(TAG, "Dropping late audio chunk: diff=${diffMs}ms")
+                    continue
+                }
+
+                diffMs > maxEarlyMs -> {
+                    Log.w(TAG, "Audio too early, resetting sync: diff=${diffMs}ms")
+                    syncBaseServerMs = null
+                    audioQueue.clear()
+                    delay(50)
+                    continue
+                }
+
+                diffMs > 20 -> {
+                    delay(diffMs.coerceAtMost(80L))
+                }
             }
 
             val written = track.write(chunk.pcm, 0, chunk.pcm.size)
 
             if (written < 0) {
                 Log.w(TAG, "AudioTrack write error: $written")
-                buffered = false
+                syncBaseServerMs = null
             }
         }
     }
@@ -467,6 +566,12 @@ class SnapcastClient(
             val bb = ByteBuffer.wrap(payload).order(ByteOrder.LITTLE_ENDIAN)
 
             val jsonLen = bb.int
+
+            if (jsonLen <= 0 || jsonLen > bb.remaining()) {
+                Log.w(TAG, "Invalid ServerSettings json length: $jsonLen")
+                return
+            }
+
             val jsonBytes = ByteArray(jsonLen)
             bb.get(jsonBytes)
 
@@ -475,8 +580,9 @@ class SnapcastClient(
             val muted = json.optBoolean("muted", false)
             val volume = json.optInt("volume", 100).coerceIn(0, 100)
 
+            // A célzott némítást továbbra is a localMuted logika kezeli.
             // A snapserver muted flagjét nem alkalmazzuk közvetlenül,
-            // mert a célzott némítást a localMuted logika kezeli.
+            // mert az ütközhet a saját célzási logikánkkal.
             serverVolume = volume
             applyEffectiveVolume()
 
@@ -486,15 +592,19 @@ class SnapcastClient(
         }
     }
 
+    // ── AudioTrack ────────────────────────────────────────────────────────
+
     @Suppress("DEPRECATION")
     private fun initAudioTrack() {
         releaseAudioTrack()
 
         val minBuf = AudioTrack.getMinBufferSize(sampleRate, channels, encoding)
 
-        // Nagyobb puffer kell, mert nálunk a robusztus lejátszás fontosabb,
-        // mint a ms-pontos szinkron.
-        val bufSize = maxOf(minBuf * 8, bytesPerMs * 1500, 65536)
+        val bufSize = maxOf(
+            minBuf * 4,
+            bytesPerMs * 1000,
+            32768
+        )
 
         audioTrack = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             AudioTrack.Builder()
