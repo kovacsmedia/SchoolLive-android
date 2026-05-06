@@ -427,8 +427,6 @@ class SnapcastClient(
             val serverTimestampMs = sec * 1000L + us / 1000L
             val pcm = payload.copyOfRange(12, 12 + pcmSize)
 
-            // Ha megtelik a queue, eldobjuk a legrégebbit.
-            // Így nem nő végtelenül a késés.
             if (audioQueue.remainingCapacity() == 0) {
                 audioQueue.poll()
             }
@@ -442,57 +440,39 @@ class SnapcastClient(
     }
 
     /**
-     * Szinkronizált lejátszás.
+     * Soft sync lejátszás.
      *
-     * Nem a 20 ms-os chunkokat időzítjük vakon.
-     * Ehelyett:
+     * A kliens induláskor a szerveridőhöz igazítja a megszólalást,
+     * de utána nem dobálja a chunkokat.
      *
-     * - a Snapcast timestamp megmondja, hogy a chunk szerveridő szerint hová tartozik;
-     * - az AudioTrack playbackHeadPosition megmondja, hogy az Android ténylegesen hol tart;
-     * - ehhez igazítjuk a várakozást / dobást / resetet.
+     * Így:
+     * - nem lesz hiányos a hang;
+     * - megmarad az indulási szinkron;
+     * - a kisebb driftet az AudioTrack folyamatos pufferelése elfedi.
      */
     private suspend fun playbackLoop() = withContext(Dispatchers.IO) {
-        val targetLatencyMs = 300L
+        val targetLatencyMs = 700L
+        val initialPrebufferChunks = 10 // kb. 200 ms, ha 20 ms/chunk
 
-        // Ha ennél később érkezik egy chunk, inkább eldobjuk,
-        // különben a késés folyamatosan nőne.
-        val maxLateMs = 120L
-
-        // Ha ennyire túl korainak tűnik, akkor valószínűleg sync reset kell.
-        val maxEarlyMs = 800L
-
-        var syncBaseServerMs: Long? = null
-        var syncBasePlaybackFrames: Long = 0L
-
-        fun playbackFrames64(track: AudioTrack): Long {
-            // API 21 kompatibilis.
-            // Rövid iskolai üzeneteknél nem várható 32 bites wraparound.
-            return track.playbackHeadPosition.toLong() and 0xFFFFFFFFL
-        }
-
-        fun playedMsSinceBase(track: AudioTrack): Long {
-            val baseServer = syncBaseServerMs ?: return 0L
-
-            val nowFrames = playbackFrames64(track)
-            val frames = nowFrames - syncBasePlaybackFrames
-
-            return if (frames <= 0) {
-                0L
-            } else {
-                (frames * 1000L) / sampleRate
-            }
-        }
+        var synced = false
 
         while (running) {
             val track = audioTrack
 
             if (track == null || !isConnected) {
-                syncBaseServerMs = null
+                synced = false
                 delay(20)
                 continue
             }
 
             if (!serverOffsetKnown) {
+                synced = false
+                delay(10)
+                continue
+            }
+
+            // Induláskor várunk egy kis puffert, hogy ne darabosan kezdjen.
+            if (!synced && audioQueue.size < initialPrebufferChunks) {
                 delay(10)
                 continue
             }
@@ -500,63 +480,33 @@ class SnapcastClient(
             val chunk = audioQueue.poll()
 
             if (chunk == null) {
+                synced = false
                 delay(5)
                 continue
             }
 
-            val base = syncBaseServerMs
-
-            if (base == null) {
-                // Első chunk ehhez képest lesz a sync alap.
-                syncBaseServerMs = chunk.serverTimestampMs
-                syncBasePlaybackFrames = playbackFrames64(track)
-
+            if (!synced) {
                 val localServerNowMs = System.currentTimeMillis() + serverOffsetMs
                 val desiredStartMs = chunk.serverTimestampMs + targetLatencyMs
                 val waitMs = desiredStartMs - localServerNowMs
 
                 if (waitMs > 0) {
+                    Log.d(TAG, "Initial sync wait: ${waitMs}ms")
                     delay(waitMs.coerceAtMost(targetLatencyMs))
+                } else {
+                    Log.d(TAG, "Initial sync late by ${-waitMs}ms, playing without drop")
                 }
 
-                val written = track.write(chunk.pcm, 0, chunk.pcm.size)
-
-                if (written < 0) {
-                    Log.w(TAG, "AudioTrack write error: $written")
-                    syncBaseServerMs = null
-                }
-
-                continue
+                synced = true
             }
 
-            val expectedServerPlaybackMs = base + playedMsSinceBase(track)
-            val desiredChunkPlaybackMs = chunk.serverTimestampMs + targetLatencyMs
-            val diffMs = desiredChunkPlaybackMs - expectedServerPlaybackMs
-
-            when {
-                diffMs < -maxLateMs -> {
-                    Log.w(TAG, "Dropping late audio chunk: diff=${diffMs}ms")
-                    continue
-                }
-
-                diffMs > maxEarlyMs -> {
-                    Log.w(TAG, "Audio too early, resetting sync: diff=${diffMs}ms")
-                    syncBaseServerMs = null
-                    audioQueue.clear()
-                    delay(50)
-                    continue
-                }
-
-                diffMs > 20 -> {
-                    delay(diffMs.coerceAtMost(80L))
-                }
-            }
-
+            // Itt szándékosan nem dobunk chunkot.
+            // A korábbi late-drop logika okozta a hiányos hangot.
             val written = track.write(chunk.pcm, 0, chunk.pcm.size)
 
             if (written < 0) {
                 Log.w(TAG, "AudioTrack write error: $written")
-                syncBaseServerMs = null
+                synced = false
             }
         }
     }
