@@ -19,7 +19,8 @@ import java.io.OutputStream
 import java.net.Socket
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
-import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.TimeUnit
 
 private const val TAG = "SnapcastClient"
 
@@ -93,7 +94,16 @@ class SnapcastClient(
     @Volatile
     private var timeSentLocalMs: Long = 0L
 
-    private val audioQueue = ArrayBlockingQueue<AudioChunk>(500)
+    /**
+     * Nem fix méretű queue-t használunk.
+     *
+     * Korábban, ha a queue megtelt, a kliens eldobta a legrégebbi chunkot.
+     * Ez hangkimaradást okozhatott.
+     *
+     * A Snapcast stream normál esetben valós időben érkezik és valós időben
+     * fogy el, ezért a queue nem nőhet nagyra, ha az AudioTrack rendben ír.
+     */
+    private val audioQueue = LinkedBlockingQueue<AudioChunk>()
 
     fun start() {
         if (running) return
@@ -427,10 +437,7 @@ class SnapcastClient(
             val serverTimestampMs = sec * 1000L + us / 1000L
             val pcm = payload.copyOfRange(12, 12 + pcmSize)
 
-            if (audioQueue.remainingCapacity() == 0) {
-                audioQueue.poll()
-            }
-
+            // Nem dobunk chunkot. A teljes hang fontosabb, mint a minimális késés.
             audioQueue.offer(AudioChunk(pcm, serverTimestampMs))
 
             onActivity()
@@ -440,19 +447,25 @@ class SnapcastClient(
     }
 
     /**
-     * Soft sync lejátszás.
+     * Akadásmentességre optimalizált Snapcast lejátszás.
      *
-     * A kliens induláskor a szerveridőhöz igazítja a megszólalást,
-     * de utána nem dobálja a chunkokat.
+     * Prioritás:
+     * 1. ne maradjon le a hang eleje;
+     * 2. ne legyen közbeni akadás;
+     * 3. ne vágódjon le a vége;
+     * 4. ne dobjunk audio chunkot;
+     * 5. a szinkron legyen elfogadható, de ne menjen a folyamatosság rovására.
      *
-     * Így:
-     * - nem lesz hiányos a hang;
-     * - megmarad az indulási szinkron;
-     * - a kisebb driftet az AudioTrack folyamatos pufferelése elfedi.
+     * Ezért:
+     * - induláskor nagyobb puffert gyűjtünk;
+     * - csak induláskor igazítunk szerveridőhöz;
+     * - lejátszás közben nem dobunk chunkot;
+     * - pillanatnyi queue-ürülésnél nem resetelünk;
+     * - az AudioTrack.write() hívást teljes blokk kiírásáig ismételjük.
      */
     private suspend fun playbackLoop() = withContext(Dispatchers.IO) {
-        val targetLatencyMs = 1200L
-        val initialPrebufferChunks = 10 // kb. 200 ms, ha 20 ms/chunk
+        val targetLatencyMs = 2200L
+        val initialPrebufferChunks = 90 // kb. 1800 ms, ha 20 ms/chunk
 
         var synced = false
 
@@ -471,43 +484,94 @@ class SnapcastClient(
                 continue
             }
 
-            // Induláskor várunk egy kis puffert, hogy ne darabosan kezdjen.
-            if (!synced && audioQueue.size < initialPrebufferChunks) {
-                delay(10)
-                continue
-            }
-
-            val chunk = audioQueue.poll()
-
-            if (chunk == null) {
-                delay(2)
-                continue
-            }
-
+            /*
+             * Induláskor nagy puffert gyűjtünk.
+             *
+             * Ez javítja:
+             * - a csengőhang eleji megtorpanását;
+             * - a mikrofonos üzenet elejének lemaradását;
+             * - az Android scheduler és hálózati jitter okozta underrunokat.
+             */
             if (!synced) {
-                val localServerNowMs = System.currentTimeMillis() + serverOffsetMs
-                val desiredStartMs = chunk.serverTimestampMs + targetLatencyMs
-                val waitMs = desiredStartMs - localServerNowMs
+                if (audioQueue.size < initialPrebufferChunks) {
+                    delay(10)
+                    continue
+                }
 
-                if (waitMs > 0) {
-                    Log.d(TAG, "Initial sync wait: ${waitMs}ms")
-                    delay(waitMs.coerceAtMost(targetLatencyMs))
-                } else {
-                    Log.d(TAG, "Initial sync late by ${-waitMs}ms, playing without drop")
+                val firstChunk = audioQueue.peek()
+
+                if (firstChunk != null) {
+                    val localServerNowMs = System.currentTimeMillis() + serverOffsetMs
+                    val desiredStartMs = firstChunk.serverTimestampMs + targetLatencyMs
+                    val waitMs = desiredStartMs - localServerNowMs
+
+                    if (waitMs > 0) {
+                        Log.d(
+                            TAG,
+                            "Initial sync wait: ${waitMs}ms, queue=${audioQueue.size}"
+                        )
+
+                        delay(waitMs.coerceAtMost(targetLatencyMs))
+                    } else {
+                        Log.d(
+                            TAG,
+                            "Initial sync late by ${-waitMs}ms, starting with queue=${audioQueue.size}"
+                        )
+                    }
                 }
 
                 synced = true
             }
 
-            // Itt szándékosan nem dobunk chunkot.
-            // A korábbi late-drop logika okozta a hiányos hangot.
-            val written = track.write(chunk.pcm, 0, chunk.pcm.size)
+            /*
+             * Nem poll-ozunk 5 ms-onként üres queue-ra.
+             *
+             * Ha pillanatnyi hálózati/scheduler csúszás van, várunk.
+             * Nem reseteljük a syncet, mert az újabb hallható megtorpanást okozna.
+             */
+            val chunk = audioQueue.poll(500, TimeUnit.MILLISECONDS)
 
-            if (written < 0) {
-                Log.w(TAG, "AudioTrack write error: $written")
+            if (chunk == null) {
+                Log.w(TAG, "Audio queue underrun, waiting without sync reset")
+                continue
+            }
+
+            val ok = writePcmFully(track, chunk.pcm)
+
+            if (!ok) {
+                Log.w(TAG, "AudioTrack write failed, resyncing")
                 synced = false
             }
         }
+    }
+
+    /**
+     * API 21 kompatibilis teljes PCM blokk kiírás.
+     *
+     * A sima AudioTrack.write(byteArray, offset, size) visszatérhet úgy,
+     * hogy csak a blokk egy részét írta ki. Ha ezt nem kezeljük, a hang
+     * apró darabjai elveszhetnek.
+     */
+    private suspend fun writePcmFully(track: AudioTrack, pcm: ByteArray): Boolean {
+        var offset = 0
+
+        while (running && offset < pcm.size) {
+            val written = track.write(pcm, offset, pcm.size - offset)
+
+            if (written < 0) {
+                Log.w(TAG, "AudioTrack write error: $written")
+                return false
+            }
+
+            if (written == 0) {
+                delay(2)
+                continue
+            }
+
+            offset += written
+        }
+
+        return offset >= pcm.size
     }
 
     private fun handleServerSettings(payload: ByteArray) {
@@ -549,10 +613,19 @@ class SnapcastClient(
 
         val minBuf = AudioTrack.getMinBufferSize(sampleRate, channels, encoding)
 
+        /*
+         * Nagyobb AudioTrack puffer.
+         *
+         * A cél itt nem a minimális latency, hanem az, hogy:
+         * - rövid csengetés ne torpanjon meg;
+         * - mikrofonos üzenet ne akadjon;
+         * - TTS ne vágódjon;
+         * - Android scheduler jitter ne ürítse ki a kimenetet.
+         */
         val bufSize = maxOf(
-            minBuf * 4,
-            bytesPerMs * 1000,
-            32768
+            minBuf * 8,
+            bytesPerMs * 2500,
+            131072
         )
 
         audioTrack = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
