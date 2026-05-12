@@ -393,26 +393,32 @@ class SnapcastClient(
     }
 
     /**
-     * Opus codec header (a CarlosDerSeher snap_app szerint):
-     *   uint32  headerSize  (= 12)
-     *   uint32  sampleRate  (pl. 48000)
-     *   uint16  bitsPerSample (16)
-     *   uint16  channels (2 = stereo)
+     * Opus codec header layout a snapcast szerver szerint (lásd:
+     * CarlosDerSeher/snap_app `codec_header_received()` Opus ága):
      *
-     * Sávszélesség: ~24x kisebb mint a PCM-é, a backend ezt használja.
+     *   uint32  codecDataSize  (= 12, az utána következő mezők összmérete)
+     *   ── codec_data 12 byte ──
+     *   uint32  [magic/padding ignored]    @ offset 0..3
+     *   uint32  sample_rate                @ offset 4..7    (pl. 48000)
+     *   uint16  bits_per_sample            @ offset 8..9    (16)
+     *   uint16  channels                   @ offset 10..11  (2 = stereo)
+     *
+     * FONTOS: az első 4 byte-ot KI KELL HAGYNI. Az ESP referencia
+     * implementáció `codecPayload + 4` offsetet használ.
      */
     private fun setupOpus(bb: ByteBuffer) {
         if (bb.remaining() < 4) return
 
-        val headerSize = bb.int  // várt: 12
-        if (headerSize < 12 || bb.remaining() < headerSize) {
-            Log.w(TAG, "Opus header too short: $headerSize, remaining=${bb.remaining()}")
+        val codecDataSize = bb.int  // várt: 12
+        if (codecDataSize < 12 || bb.remaining() < codecDataSize) {
+            Log.w(TAG, "Opus codec_data too short: $codecDataSize, remaining=${bb.remaining()}")
             return
         }
 
-        val rate    = bb.int
-        val bits    = bb.short.toInt() and 0xFFFF
-        val ch      = bb.short.toInt() and 0xFFFF
+        bb.int                                  // skip 4 byte magic/padding
+        val rate = bb.int                       // sample rate
+        val bits = bb.short.toInt() and 0xFFFF
+        val ch   = bb.short.toInt() and 0xFFFF
 
         sampleRate = rate
         opusChannelCount = ch
