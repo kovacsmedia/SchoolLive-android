@@ -101,6 +101,13 @@ class SnapcastClient(
     @Volatile
     private var serverVolume: Int = 100
 
+    // A snap szerver oldali jitter buffer mélysége. A snapserver
+    // ServerSettings üzenetben küldi minden klienseinek (alapérték: 1000 ms).
+    // Az ESP, Linux és Android klienseknek UGYANAZT az értéket kell használnia
+    // a playback latency-hez, különben szinkronizálva nem szólnak (multiroom).
+    @Volatile
+    private var serverBufferMs: Long = 1000L
+
     // ── Snap time sync ────────────────────────────────────────────────────
 
     @Volatile
@@ -565,7 +572,9 @@ class SnapcastClient(
      * - a kisebb driftet az AudioTrack folyamatos pufferelése elfedi.
      */
     private suspend fun playbackLoop() = withContext(Dispatchers.IO) {
-        val targetLatencyMs = 1200L
+        // A targetLatencyMs a snap szerver oldali jitter buffer mélysége
+        // (serverBufferMs, ami a server_settings üzenetből frissül).
+        // Multiroom konzisztencia: minden kliens UGYANAZT az értéket használja.
         val initialPrebufferChunks = 10 // kb. 200 ms, ha 20 ms/chunk
 
         var synced = false
@@ -599,15 +608,16 @@ class SnapcastClient(
             }
 
             if (!synced) {
+                val bufferMs = serverBufferMs
                 val localServerNowMs = System.currentTimeMillis() + serverOffsetMs
-                val desiredStartMs = chunk.serverTimestampMs + targetLatencyMs
+                val desiredStartMs = chunk.serverTimestampMs + bufferMs
                 val waitMs = desiredStartMs - localServerNowMs
 
                 if (waitMs > 0) {
-                    Log.d(TAG, "Initial sync wait: ${waitMs}ms")
-                    delay(waitMs.coerceAtMost(targetLatencyMs))
+                    Log.d(TAG, "Initial sync wait: ${waitMs}ms (bufferMs=$bufferMs)")
+                    delay(waitMs.coerceAtMost(bufferMs))
                 } else {
-                    Log.d(TAG, "Initial sync late by ${-waitMs}ms, playing without drop")
+                    Log.d(TAG, "Initial sync late by ${-waitMs}ms (bufferMs=$bufferMs), playing without drop")
                 }
 
                 synced = true
@@ -642,14 +652,22 @@ class SnapcastClient(
 
             val muted = json.optBoolean("muted", false)
             val volume = json.optInt("volume", 100).coerceIn(0, 100)
+            val bufferMs = json.optInt("bufferMs", 1000).toLong().coerceIn(200L, 5000L)
 
             // A célzott némítást továbbra is a localMuted logika kezeli.
-            // A snapserver muted flagjét nem alkalmazzuk közvetlenül,
-            // mert az ütközhet a saját célzási logikánkkal.
+            // A snapserver muted flagjét és serverVolume-t nem alkalmazzuk
+            // (lásd applyEffectiveVolume() ESP-szabványú viselkedés).
             serverVolume = volume
+
+            // A bufferMs viszont KRITIKUS a multiroom szinkronhoz: az ESP,
+            // Android és Linux klienseknek ugyanazt a buffer-mélységet kell
+            // használnia. Ha az Android 1200 ms-mal játszott, az ESP 1000-rel,
+            // 200 ms eltolódás van a két forrás közt.
+            serverBufferMs = bufferMs
+
             applyEffectiveVolume()
 
-            Log.d(TAG, "ServerSettings: vol=$volume muted=$muted ignored")
+            Log.d(TAG, "ServerSettings: vol=$volume muted=$muted bufferMs=$bufferMs (vol/muted ignored, bufferMs applied)")
         } catch (e: Exception) {
             Log.w(TAG, "ServerSettings parse error: ${e.message}")
         }
