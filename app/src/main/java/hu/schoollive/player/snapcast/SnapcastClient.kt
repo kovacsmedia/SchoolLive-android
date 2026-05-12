@@ -13,14 +13,14 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import org.concentus.OpusDecoder
 import org.json.JSONObject
 import java.io.InputStream
 import java.io.OutputStream
 import java.net.Socket
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
-import java.util.concurrent.LinkedBlockingQueue
-import java.util.concurrent.TimeUnit
+import java.util.concurrent.ArrayBlockingQueue
 
 private const val TAG = "SnapcastClient"
 
@@ -69,6 +69,24 @@ class SnapcastClient(
     private var encoding = AudioFormat.ENCODING_PCM_16BIT
     private var bytesPerMs = 192
 
+    // ── Codec állapot ─────────────────────────────────────────────────────
+    //
+    // A backend snapserver `codec=opus&bitrate=192&chunk_ms=20` beállítást
+    // használ az atomstabil multiroom streamhez. A WireChunk payload Opus-
+    // kódolt, és a kliensnek dekódolnia kell PCM-mé az AudioTrack lejátszás
+    // előtt. A PCM fallback megmarad, ha a snapserver mégis PCM-mel küld.
+    private enum class Codec { UNKNOWN, PCM, OPUS }
+
+    @Volatile
+    private var currentCodec: Codec = Codec.UNKNOWN
+
+    private var opusChannelCount: Int = 2
+    private var opusDecoder: OpusDecoder? = null
+
+    // Az opus_decode kimenete int16 PCM samples; a max chunk 60 ms @ 48kHz
+    // stereo = 5760 sample. 8192 biztonsági puffer.
+    private val opusOutShorts = ShortArray(8192)
+
     // ── Volume / mute állapot ─────────────────────────────────────────────
 
     @Volatile
@@ -94,16 +112,7 @@ class SnapcastClient(
     @Volatile
     private var timeSentLocalMs: Long = 0L
 
-    /**
-     * Nem fix méretű queue-t használunk.
-     *
-     * Korábban, ha a queue megtelt, a kliens eldobta a legrégebbi chunkot.
-     * Ez hangkimaradást okozhatott.
-     *
-     * A Snapcast stream normál esetben valós időben érkezik és valós időben
-     * fogy el, ezért a queue nem nőhet nagyra, ha az AudioTrack rendben ír.
-     */
-    private val audioQueue = LinkedBlockingQueue<AudioChunk>()
+    private val audioQueue = ArrayBlockingQueue<AudioChunk>(500)
 
     fun start() {
         if (running) return
@@ -141,8 +150,20 @@ class SnapcastClient(
     }
 
     private fun applyEffectiveVolume() {
-        val muted = localMuted || serverMuted
-        val effective = if (muted) 0 else minOf(userVolume, serverVolume)
+        /*
+         * ESP-szabványú viselkedés:
+         * A snap szerver oldali mute/volume beállításokat IGNORÁLJUK. A
+         * backend `applyTargetingToClients` ezeket úgy állítja be, hogy
+         * minden kliens "muted=true volume=0", és csak a célzott eszközöket
+         * unmutázza - de a snap szerver oldali server-settings broadcast a
+         * lejátszás közben rajzol új resync-eket. A klienseink (ESP, Android,
+         * Linux/Windows) önmaguk döntenek a hangerőről a saját userVolume +
+         * localMute alapján.
+         *
+         * A serverMuted / serverVolume mezőket továbbra is olvassuk a logba,
+         * de NEM applikáljuk az AudioTrack-re.
+         */
+        val effective = if (localMuted) 0 else userVolume
 
         audioTrack?.setVolume(effective / 100f)
     }
@@ -349,47 +370,18 @@ class SnapcastClient(
                 return
             }
 
-            val codec = String(ByteArray(nameLen).also { bb.get(it) })
+            val codecName = String(ByteArray(nameLen).also { bb.get(it) })
+            Log.d(TAG, "Codec: $codecName")
 
-            Log.d(TAG, "Codec: $codec")
-
-            if (codec.lowercase() == "pcm" && bb.remaining() >= 16) {
-                val headerSize = bb.int
-
-                if (headerSize >= 28 && bb.remaining() >= 28) {
-                    bb.int
-                    bb.int
-                    bb.int
-                    bb.int
-                    bb.int
-
-                    bb.short
-
-                    val ch = bb.short.toInt() and 0xFFFF
-                    val rate = bb.int
-
-                    bb.int
-                    bb.short
-
-                    val bits = bb.short.toInt() and 0xFFFF
-
-                    sampleRate = rate
-
-                    channels = if (ch == 2) {
-                        AudioFormat.CHANNEL_OUT_STEREO
-                    } else {
-                        AudioFormat.CHANNEL_OUT_MONO
-                    }
-
-                    encoding = if (bits == 16) {
-                        AudioFormat.ENCODING_PCM_16BIT
-                    } else {
-                        AudioFormat.ENCODING_PCM_8BIT
-                    }
-
-                    bytesPerMs = (rate * ch * if (bits == 16) 2 else 1) / 1000
-
-                    Log.d(TAG, "PCM: ${ch}ch ${bits}bit ${rate}Hz → $bytesPerMs bytes/ms")
+            // Az ezt követő opus / pcm specifikus header méret prefix.
+            // Mindkét codec-nél van egy `uint32 headerSize` mező, utána a
+            // codec-specifikus header tartalom.
+            when (codecName.lowercase()) {
+                "opus" -> setupOpus(bb)
+                "pcm"  -> setupPcm(bb)
+                else -> {
+                    Log.w(TAG, "Unsupported codec: $codecName")
+                    return
                 }
             }
 
@@ -398,6 +390,71 @@ class SnapcastClient(
         } catch (e: Exception) {
             Log.w(TAG, "CodecHeader parse error: ${e.message}")
         }
+    }
+
+    /**
+     * Opus codec header (a CarlosDerSeher snap_app szerint):
+     *   uint32  headerSize  (= 12)
+     *   uint32  sampleRate  (pl. 48000)
+     *   uint16  bitsPerSample (16)
+     *   uint16  channels (2 = stereo)
+     *
+     * Sávszélesség: ~24x kisebb mint a PCM-é, a backend ezt használja.
+     */
+    private fun setupOpus(bb: ByteBuffer) {
+        if (bb.remaining() < 4) return
+
+        val headerSize = bb.int  // várt: 12
+        if (headerSize < 12 || bb.remaining() < headerSize) {
+            Log.w(TAG, "Opus header too short: $headerSize, remaining=${bb.remaining()}")
+            return
+        }
+
+        val rate    = bb.int
+        val bits    = bb.short.toInt() and 0xFFFF
+        val ch      = bb.short.toInt() and 0xFFFF
+
+        sampleRate = rate
+        opusChannelCount = ch
+        channels = if (ch == 2) AudioFormat.CHANNEL_OUT_STEREO else AudioFormat.CHANNEL_OUT_MONO
+        encoding = AudioFormat.ENCODING_PCM_16BIT
+        bytesPerMs = (rate * ch * 2) / 1000
+        currentCodec = Codec.OPUS
+
+        // Új Opus decoder ehhez a stream-konfigurációhoz.
+        opusDecoder = OpusDecoder(rate, ch)
+
+        Log.d(TAG, "Opus: ${ch}ch ${bits}bit ${rate}Hz → $bytesPerMs bytes/ms PCM (decoder ready)")
+    }
+
+    /**
+     * PCM codec header (raw uncompressed, fallback):
+     * A WAV-like RIFF fmt chunk-tartalom van benne.
+     */
+    private fun setupPcm(bb: ByteBuffer) {
+        if (bb.remaining() < 16) return
+
+        val headerSize = bb.int
+        if (headerSize < 28 || bb.remaining() < 28) return
+
+        bb.int; bb.int; bb.int; bb.int; bb.int
+        bb.short
+
+        val ch = bb.short.toInt() and 0xFFFF
+        val rate = bb.int
+        bb.int
+        bb.short
+
+        val bits = bb.short.toInt() and 0xFFFF
+
+        sampleRate = rate
+        channels = if (ch == 2) AudioFormat.CHANNEL_OUT_STEREO else AudioFormat.CHANNEL_OUT_MONO
+        encoding = if (bits == 16) AudioFormat.ENCODING_PCM_16BIT else AudioFormat.ENCODING_PCM_8BIT
+        bytesPerMs = (rate * ch * if (bits == 16) 2 else 1) / 1000
+        currentCodec = Codec.PCM
+        opusDecoder = null
+
+        Log.d(TAG, "PCM: ${ch}ch ${bits}bit ${rate}Hz → $bytesPerMs bytes/ms")
     }
 
     /**
@@ -422,22 +479,32 @@ class SnapcastClient(
 
             val sec = bb.int.toLong()
             val us = bb.int.toLong()
-            val pcmSize = bb.int
+            val encSize = bb.int  // OPUS-nál tömörített, PCM-nél a PCM méret
 
-            if (pcmSize <= 0) return
+            if (encSize <= 0) return
 
-            if (payload.size < 12 + pcmSize) {
+            if (payload.size < 12 + encSize) {
                 Log.w(
                     TAG,
-                    "WireChunk too short: payload=${payload.size}, declaredPcmSize=$pcmSize"
+                    "WireChunk too short: payload=${payload.size}, declaredSize=$encSize"
                 )
                 return
             }
 
             val serverTimestampMs = sec * 1000L + us / 1000L
-            val pcm = payload.copyOfRange(12, 12 + pcmSize)
+            val pcm: ByteArray = when (currentCodec) {
+                Codec.OPUS -> decodeOpusToPcm(payload, 12, encSize) ?: return
+                Codec.PCM  -> payload.copyOfRange(12, 12 + encSize)
+                else -> {
+                    // Codec header még nem érkezett, eldobjuk a chunk-ot.
+                    return
+                }
+            }
 
-            // Nem dobunk chunkot. A teljes hang fontosabb, mint a minimális késés.
+            if (audioQueue.remainingCapacity() == 0) {
+                audioQueue.poll()
+            }
+
             audioQueue.offer(AudioChunk(pcm, serverTimestampMs))
 
             onActivity()
@@ -447,25 +514,53 @@ class SnapcastClient(
     }
 
     /**
-     * Akadásmentességre optimalizált Snapcast lejátszás.
+     * Egy Opus packet dekódolása PCM-re.
      *
-     * Prioritás:
-     * 1. ne maradjon le a hang eleje;
-     * 2. ne legyen közbeni akadás;
-     * 3. ne vágódjon le a vége;
-     * 4. ne dobjunk audio chunkot;
-     * 5. a szinkron legyen elfogadható, de ne menjen a folyamatosság rovására.
+     * A Concentus `OpusDecoder.decode()` int16[] kimenetre dolgozik, amit
+     * little-endian byte arrayre konvertálunk az AudioTrack számára.
      *
-     * Ezért:
-     * - induláskor nagyobb puffert gyűjtünk;
-     * - csak induláskor igazítunk szerveridőhöz;
-     * - lejátszás közben nem dobunk chunkot;
-     * - pillanatnyi queue-ürülésnél nem resetelünk;
-     * - az AudioTrack.write() hívást teljes blokk kiírásáig ismételjük.
+     * @return a dekódolt PCM bytes, vagy null hibára (a chunk eldobódik).
+     */
+    private fun decodeOpusToPcm(src: ByteArray, srcOffset: Int, srcLen: Int): ByteArray? {
+        val decoder = opusDecoder ?: return null
+
+        return try {
+            val samplesPerChannel = decoder.decode(
+                src, srcOffset, srcLen,
+                opusOutShorts, 0, opusOutShorts.size / opusChannelCount,
+                false
+            )
+            if (samplesPerChannel <= 0) return null
+
+            val totalSamples = samplesPerChannel * opusChannelCount
+            val out = ByteArray(totalSamples * 2)
+            val outBuf = ByteBuffer.wrap(out).order(ByteOrder.LITTLE_ENDIAN)
+
+            for (i in 0 until totalSamples) {
+                outBuf.putShort(opusOutShorts[i])
+            }
+
+            out
+        } catch (e: Exception) {
+            Log.w(TAG, "Opus decode error: ${e.message}")
+            null
+        }
+    }
+
+    /**
+     * Soft sync lejátszás.
+     *
+     * A kliens induláskor a szerveridőhöz igazítja a megszólalást,
+     * de utána nem dobálja a chunkokat.
+     *
+     * Így:
+     * - nem lesz hiányos a hang;
+     * - megmarad az indulási szinkron;
+     * - a kisebb driftet az AudioTrack folyamatos pufferelése elfedi.
      */
     private suspend fun playbackLoop() = withContext(Dispatchers.IO) {
-        val targetLatencyMs = 2200L
-        val initialPrebufferChunks = 90 // kb. 1800 ms, ha 20 ms/chunk
+        val targetLatencyMs = 1200L
+        val initialPrebufferChunks = 10 // kb. 200 ms, ha 20 ms/chunk
 
         var synced = false
 
@@ -484,94 +579,43 @@ class SnapcastClient(
                 continue
             }
 
-            /*
-             * Induláskor nagy puffert gyűjtünk.
-             *
-             * Ez javítja:
-             * - a csengőhang eleji megtorpanását;
-             * - a mikrofonos üzenet elejének lemaradását;
-             * - az Android scheduler és hálózati jitter okozta underrunokat.
-             */
+            // Induláskor várunk egy kis puffert, hogy ne darabosan kezdjen.
+            if (!synced && audioQueue.size < initialPrebufferChunks) {
+                delay(10)
+                continue
+            }
+
+            val chunk = audioQueue.poll()
+
+            if (chunk == null) {
+                delay(2)
+                continue
+            }
+
             if (!synced) {
-                if (audioQueue.size < initialPrebufferChunks) {
-                    delay(10)
-                    continue
-                }
+                val localServerNowMs = System.currentTimeMillis() + serverOffsetMs
+                val desiredStartMs = chunk.serverTimestampMs + targetLatencyMs
+                val waitMs = desiredStartMs - localServerNowMs
 
-                val firstChunk = audioQueue.peek()
-
-                if (firstChunk != null) {
-                    val localServerNowMs = System.currentTimeMillis() + serverOffsetMs
-                    val desiredStartMs = firstChunk.serverTimestampMs + targetLatencyMs
-                    val waitMs = desiredStartMs - localServerNowMs
-
-                    if (waitMs > 0) {
-                        Log.d(
-                            TAG,
-                            "Initial sync wait: ${waitMs}ms, queue=${audioQueue.size}"
-                        )
-
-                        delay(waitMs.coerceAtMost(targetLatencyMs))
-                    } else {
-                        Log.d(
-                            TAG,
-                            "Initial sync late by ${-waitMs}ms, starting with queue=${audioQueue.size}"
-                        )
-                    }
+                if (waitMs > 0) {
+                    Log.d(TAG, "Initial sync wait: ${waitMs}ms")
+                    delay(waitMs.coerceAtMost(targetLatencyMs))
+                } else {
+                    Log.d(TAG, "Initial sync late by ${-waitMs}ms, playing without drop")
                 }
 
                 synced = true
             }
 
-            /*
-             * Nem poll-ozunk 5 ms-onként üres queue-ra.
-             *
-             * Ha pillanatnyi hálózati/scheduler csúszás van, várunk.
-             * Nem reseteljük a syncet, mert az újabb hallható megtorpanást okozna.
-             */
-            val chunk = audioQueue.poll(500, TimeUnit.MILLISECONDS)
-
-            if (chunk == null) {
-                Log.w(TAG, "Audio queue underrun, waiting without sync reset")
-                continue
-            }
-
-            val ok = writePcmFully(track, chunk.pcm)
-
-            if (!ok) {
-                Log.w(TAG, "AudioTrack write failed, resyncing")
-                synced = false
-            }
-        }
-    }
-
-    /**
-     * API 21 kompatibilis teljes PCM blokk kiírás.
-     *
-     * A sima AudioTrack.write(byteArray, offset, size) visszatérhet úgy,
-     * hogy csak a blokk egy részét írta ki. Ha ezt nem kezeljük, a hang
-     * apró darabjai elveszhetnek.
-     */
-    private suspend fun writePcmFully(track: AudioTrack, pcm: ByteArray): Boolean {
-        var offset = 0
-
-        while (running && offset < pcm.size) {
-            val written = track.write(pcm, offset, pcm.size - offset)
+            // Itt szándékosan nem dobunk chunkot.
+            // A korábbi late-drop logika okozta a hiányos hangot.
+            val written = track.write(chunk.pcm, 0, chunk.pcm.size)
 
             if (written < 0) {
                 Log.w(TAG, "AudioTrack write error: $written")
-                return false
+                synced = false
             }
-
-            if (written == 0) {
-                delay(2)
-                continue
-            }
-
-            offset += written
         }
-
-        return offset >= pcm.size
     }
 
     private fun handleServerSettings(payload: ByteArray) {
@@ -613,19 +657,10 @@ class SnapcastClient(
 
         val minBuf = AudioTrack.getMinBufferSize(sampleRate, channels, encoding)
 
-        /*
-         * Nagyobb AudioTrack puffer.
-         *
-         * A cél itt nem a minimális latency, hanem az, hogy:
-         * - rövid csengetés ne torpanjon meg;
-         * - mikrofonos üzenet ne akadjon;
-         * - TTS ne vágódjon;
-         * - Android scheduler jitter ne ürítse ki a kimenetet.
-         */
         val bufSize = maxOf(
-            minBuf * 8,
-            bytesPerMs * 2500,
-            131072
+            minBuf * 4,
+            bytesPerMs * 1000,
+            32768
         )
 
         audioTrack = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {

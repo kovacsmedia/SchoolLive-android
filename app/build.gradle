@@ -61,4 +61,14 @@ dependencies {
     implementation 'com.google.code.gson:gson:2.10.1'
 
     implementation 'org.mindrot:jbcrypt:0.4'
+
+    // Opus codec dekódolás a snapcast streamhez. Concentus = pure Java port
+    // a libopus-ból, NDK / natív lib nélkül. A backend a snapserver-en
+    // `codec=opus&bitrate=192&chunk_ms=20` beállítást használja, így a
+    // snapcast kliensnek Opus-t kell tudnia dekódolni (PCM helyett).
+    // JitPack: https://github.com/lostromb/concentus
+    // master-SNAPSHOT mindig a legfrissebb master commit-ra mutat;
+    // ha reprodukálható build kell, cseréld konkrét commit hash-re,
+    // pl. `com.github.lostromb:concentus:6c2328dc19`.
+    implementation 'com.github.lostromb:concentus:master-SNAPSHOT'
 }

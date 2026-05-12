@@ -13,6 +13,10 @@ dependencyResolutionManagement {
     repositories {
         google()
         mavenCentral()
+        // JitPack: a Concentus (pure Java Opus codec) onnan érhető el
+        // hivatalosan, mert a Maven Central-on a `org.concentus:Concentus`
+        // artifact nem publikus.
+        maven { url 'https://jitpack.io' }
     }
 }
 rootProject.name = "SchoolLive"
