@@ -632,13 +632,19 @@ class SnapcastClient(
                 val bufferMs = serverBufferMs
                 val localServerNowMs = System.currentTimeMillis() + serverOffsetMs
                 val desiredStartMs = chunk.serverTimestampMs + bufferMs
-                val waitMs = desiredStartMs - localServerNowMs
+
+                // AudioTrack output-latency kompenzáció: a track.write után
+                // a tényleges DAC-szólalás még X ms (kisebb-puffer + LOW_LATENCY
+                // mode-ban ~20-50ms). Korábbra ütemezzük a write-ot, hogy a
+                // DAC-szólalási idő egybe essen a desiredStartMs-szel.
+                val trackLatencyMs = audioTrackOutputLatencyMs()
+                val waitMs = desiredStartMs - localServerNowMs - trackLatencyMs
 
                 if (waitMs > 0) {
-                    Log.d(TAG, "Initial sync wait: ${waitMs}ms (bufferMs=$bufferMs)")
+                    Log.d(TAG, "Initial sync wait: ${waitMs}ms (bufferMs=$bufferMs, trackLatency=${trackLatencyMs}ms)")
                     delay(waitMs.coerceAtMost(bufferMs))
                 } else {
-                    Log.d(TAG, "Initial sync late by ${-waitMs}ms (bufferMs=$bufferMs), playing without drop")
+                    Log.d(TAG, "Initial sync late by ${-waitMs}ms (bufferMs=$bufferMs, trackLatency=${trackLatencyMs}ms), playing without drop")
                 }
 
                 synced = true
@@ -697,16 +703,53 @@ class SnapcastClient(
     // ── AudioTrack ────────────────────────────────────────────────────────
 
     @Suppress("DEPRECATION")
+    /**
+     * AudioTrack tényleges DAC-output latency becslés ms-ben. Két forrás:
+     *   - Android Q+ AudioTrack.getTimestamp() (precíz hardware timestamp)
+     *   - Fallback: buffer-size + minBufferSize alapján durva becslés
+     *
+     * A snap multiroom-szinkronhoz lényeges: a track.write() után még X ms
+     * múlva szól a hangszórón – ezzel kell előbbre ütemezni a kezdést.
+     */
+    private fun audioTrackOutputLatencyMs(): Long {
+        val track = audioTrack ?: return 0L
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                val ts = android.media.AudioTimestamp()
+                if (track.getTimestamp(ts)) {
+                    val now = System.nanoTime()
+                    // ts.nanoTime: amikor a ts.framePosition frame szólalt meg
+                    // a DAC-on. A puffer-mélységet ettől visszafelé számoljuk.
+                    val written = track.playbackHeadPosition.toLong()
+                    val framesAhead = written - ts.framePosition
+                    if (framesAhead > 0 && sampleRate > 0) {
+                        val latencyMs = framesAhead * 1000L / sampleRate
+                        return latencyMs.coerceIn(0L, 500L)
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            // ignore – fallback alább
+        }
+        // Fallback: a buffer-méret kb-i latency-je (kisebb puffer = kisebb latency).
+        // A kisebb-puffer + LOW_LATENCY mode-ban tipikusan 20-50ms.
+        return 40L
+    }
+
     private fun initAudioTrack() {
         releaseAudioTrack()
 
         val minBuf = AudioTrack.getMinBufferSize(sampleRate, channels, encoding)
 
-        val bufSize = maxOf(
-            minBuf * 4,
-            bytesPerMs * 1000,
-            32768
-        )
+        // KISEBB puffer + LOW_LATENCY mode → a tényleges DAC-szólalás
+        // a track.write() után ~20-50 ms-en belül történik (régi 1 sec
+        // puffer helyett). A snap multiroom-szinkronhoz közelebb hozza
+        // az ESP-hez (ott I2S DMA ~5-20 ms). Az underrun-veszélyt a snap-
+        // server biztosítja a maga bufferMs (1 sec) szinkron-pufferével –
+        // a snapserver az aktuális stream előre 1 sec PCM-et küld, nem
+        // szükséges hogy a kliens-AudioTrack saját +1 sec pufferrel
+        // dolgozzon.
+        val bufSize = maxOf(minBuf * 2, 16384)
 
         audioTrack = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             AudioTrack.Builder()
@@ -725,6 +768,14 @@ class SnapcastClient(
                 )
                 .setBufferSizeInBytes(bufSize)
                 .setTransferMode(AudioTrack.MODE_STREAM)
+                .apply {
+                    // Android Q+ low-latency hint: a HAL-t alacsony latency-ű
+                    // mode-ba kéri, ha a hardware tudja. Régebbi Android-on
+                    // (M-P) figyelmen kívül marad.
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
+                    }
+                }
                 .build()
         } else {
             AudioTrack(
@@ -741,7 +792,7 @@ class SnapcastClient(
 
         applyEffectiveVolume()
 
-        Log.d(TAG, "AudioTrack ready: ${sampleRate}Hz buf=$bufSize")
+        Log.d(TAG, "AudioTrack ready: ${sampleRate}Hz buf=$bufSize (low-latency mode)")
     }
 
     private fun releaseAudioTrack() {
