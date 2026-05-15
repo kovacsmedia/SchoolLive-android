@@ -83,6 +83,20 @@ private fun jsonStringList(json: JSONObject, key: String): List<String> {
     return out
 }
 
+/**
+ * NOW_PLAYING_INFO esemény – a backend `audio-mixer onSourceStart` push-ja.
+ * Forrás-csere (pl. TTS megszakítja a rádiót → TTS vége → RADIO resume) után
+ * a HUD-frissítéshez használjuk. NEM tartalmaz targeting-listát (a backend
+ * minden tenant-eszközre broadcast-olja), ezért a kliens dönt arról saját
+ * localMuted állapota alapján, hogy ténylegesen mutat-e HUD-ot.
+ */
+data class NowPlayingInfo(
+    val jobType: String,    // "BELL" | "TTS" | "RADIO"
+    val title: String,
+    val sourceType: String,
+    val durationMs: Long?,
+)
+
 class SyncClient(
     private val wsUrl: String,
     private val onBell: (BellEvent) -> Unit = {},
@@ -92,6 +106,10 @@ class SyncClient(
     private val onSyncBells: () -> Unit = {},
     private val onConnected: () -> Unit = {},
     private val onDisconnected: () -> Unit = {},
+    // NOW_PLAYING_INFO push (forrás-csere HUD-frissítés). A kliensnek itt
+    // KELL a localMuted-et néznie, mert ez a push minden eszközre megy,
+    // célzás-listával együtt nem.
+    private val onNowPlayingInfo: (NowPlayingInfo) -> Unit = {},
 
     // Net LED pulse trigger – minden beérkező WS üzenetnél hívódik.
     private val onActivity: () -> Unit = {},
@@ -429,34 +447,22 @@ class SyncClient(
                                     TAG,
                                     "NOW_PLAYING_INFO: $jobType '$title' (source=$sourceType)"
                                 )
-                                when (jobType) {
-                                    "BELL" -> onBell(
-                                        BellEvent(
-                                            soundFile = title,
-                                            playAtMs = System.currentTimeMillis(),
-                                            durationMs = durationMs,
-                                            snapActive = true,
-                                            unmutedDeviceIds = emptyList(),
-                                        )
-                                    )
-                                    "TTS" -> onTts(
-                                        TtsEvent(
-                                            text = "",
-                                            title = if (title.isNotEmpty()) title else "Hangos közlemény",
-                                            playAtMs = System.currentTimeMillis(),
-                                            durationMs = durationMs,
-                                            snapActive = true,
-                                            unmutedDeviceIds = emptyList(),
-                                        )
-                                    )
-                                    "RADIO" -> onRadio(
-                                        RadioEvent(
-                                            title = if (title.isNotEmpty()) title else "Iskolarádió",
-                                            snapActive = true,
-                                            unmutedDeviceIds = emptyList(),
-                                        )
-                                    )
-                                }
+                                // FONTOS: NE onBell/onTts/onRadio-t hívjunk – azok a
+                                // PREPARE/PLAY flow eseményei, célzás-listával jönnek.
+                                // A NOW_PLAYING_INFO célzás nélküli broadcast (a backend
+                                // source:start eventjén megy ki minden tenant-eszközre),
+                                // ezért ha az `applyTargeting`-on át mennénk, az üres
+                                // unmutedDeviceIds miatt mindig HUD-ot mutatna – akkor is,
+                                // ha az eszköz nem célzott.
+                                // Helyette külön callback (`onNowPlayingInfo`), és a
+                                // PlayerService a snapClient.isLocalMuted() alapján
+                                // dönt arról, hogy mutat-e HUD-ot.
+                                onNowPlayingInfo(NowPlayingInfo(
+                                    jobType    = jobType,
+                                    title      = title,
+                                    sourceType = sourceType,
+                                    durationMs = durationMs,
+                                ))
                             }
                         }
                     }

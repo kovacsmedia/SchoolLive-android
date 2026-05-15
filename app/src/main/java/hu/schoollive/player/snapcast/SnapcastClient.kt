@@ -156,6 +156,15 @@ class SnapcastClient(
         Log.d(TAG, "localMute=$muted")
     }
 
+    /**
+     * Aktuális local-mute állapot lekérdezése. A PlayerService a NOW_PLAYING_INFO
+     * broadcast feldolgozásakor használja: a backend ezt minden tenant-eszközre
+     * elküldi (nem ismer célzást a source:start eventen), tehát a kliens itt
+     * dönt arról, hogy mutat-e HUD-ot. Ha localMuted=true → nem hallja az
+     * audiót → nincs HUD; ha false → szól a snap-en → HUD megjelenhet.
+     */
+    fun isLocalMuted(): Boolean = localMuted
+
     private fun applyEffectiveVolume() {
         /*
          * ESP-szabványú viselkedés:

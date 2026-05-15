@@ -180,6 +180,41 @@ class PlayerService : Service() {
                     snapClient?.setLocalMute(true)
                     onStop?.invoke()
                 },
+                // NOW_PLAYING_INFO: forrás-csere broadcast. NEM tartalmaz célzás-
+                // listát, ezért nem mehet az applyTargeting-on. Helyette a snap
+                // kliens localMuted-jét nézzük: ha NEM néma, akkor a kliens hallja
+                // az audiót → HUD-ot is mutatunk. Ha néma, akkor nem szól → nincs
+                // HUD. A `unmutedDeviceIds = emptyList()` placeholder marad, mert
+                // a fogadó oldali HUD overlay nem nézi (csak a meta-adatokat).
+                onNowPlayingInfo = { info ->
+                    if (snapClient?.isLocalMuted() == true) {
+                        Log.d(TAG, "NOW_PLAYING_INFO ${info.jobType}: localMuted=true → HUD skip")
+                        return@SyncClient
+                    }
+                    val now = System.currentTimeMillis()
+                    when (info.jobType) {
+                        "BELL" -> onBell?.invoke(BellEvent(
+                            soundFile        = info.title,
+                            playAtMs         = now,
+                            durationMs       = info.durationMs,
+                            snapActive       = true,
+                            unmutedDeviceIds = emptyList(),
+                        ))
+                        "TTS" -> onTts?.invoke(TtsEvent(
+                            text             = "",
+                            title            = if (info.title.isNotEmpty()) info.title else "Hangos közlemény",
+                            playAtMs         = now,
+                            durationMs       = info.durationMs,
+                            snapActive       = true,
+                            unmutedDeviceIds = emptyList(),
+                        ))
+                        "RADIO" -> onRadio?.invoke(RadioEvent(
+                            title            = if (info.title.isNotEmpty()) info.title else "Iskolarádió",
+                            snapActive       = true,
+                            unmutedDeviceIds = emptyList(),
+                        ))
+                    }
+                },
                 onSyncBells = { scope.launch { refreshBells() } },
                 onConnected = {
                     wsConnected = true
