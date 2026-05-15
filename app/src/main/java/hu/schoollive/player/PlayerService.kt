@@ -3,6 +3,7 @@ package hu.schoollive.player
 import android.app.*
 import android.content.Context
 import android.content.Intent
+import android.media.AudioManager
 import android.os.Binder
 import android.os.Build
 import android.os.IBinder
@@ -187,7 +188,47 @@ class PlayerService : Service() {
         }
     }
 
-    fun setVolume(percent: Int) { snapClient?.setVolume(percent) }
+    /** Lazy Android system AudioManager – a STREAM_MUSIC (media) volume-ot
+     *  állítjuk vele a snapclient saját puffer-gain-jén túl. Ez biztosítja,
+     *  hogy a backend SET_VOLUME parancsa tényleg a fizikai kimenetig
+     *  érvényesüljön; ha a system media-volume halk vagy néma, hiába
+     *  állítjuk az AudioTrack volume-ját 1.0-ra. */
+    private val sysAudio: AudioManager by lazy {
+        getSystemService(AUDIO_SERVICE) as AudioManager
+    }
+
+    fun setVolume(percent: Int) {
+        snapClient?.setVolume(percent)
+        // Android STREAM_MUSIC (media) volume is mozogjon.
+        try {
+            val clamped = percent.coerceIn(0, 100)
+            val max = sysAudio.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+            val target = (max * clamped / 100).coerceIn(0, max)
+            sysAudio.setStreamVolume(AudioManager.STREAM_MUSIC, target, 0)
+        } catch (e: SecurityException) {
+            // DND/Notification policy access nélkül Android dobhat: ignore.
+            Log.w("PlayerService", "setStreamVolume denied: ${e.message}")
+        } catch (e: Exception) {
+            Log.w("PlayerService", "setStreamVolume error: ${e.message}")
+        }
+    }
+
+    /** Backend MUTE parancs – a snap localMute mellett az Android media
+     *  stream-et is 0-ra állítja. Az unmute parancs nem visszaállítja a
+     *  hangerőt (mert az user-szinten változhat közben), csak a snap localMute-ot
+     *  oldja. A backend külön SET_VOLUME parancsa fogja a hangerőt visszaadni. */
+    fun setMute(muted: Boolean) {
+        snapClient?.setLocalMute(muted)
+        if (muted) {
+            try {
+                sysAudio.setStreamVolume(AudioManager.STREAM_MUSIC, 0, 0)
+            } catch (e: Exception) {
+                Log.w("PlayerService", "setStreamVolume mute error: ${e.message}")
+            }
+        }
+        // Unmute esetén nem touch-elunk – a következő SET_VOLUME (vagy user
+        // hangerő-gombja) hozza vissza a kívánt szintet.
+    }
 
     /** Backend fordított targetingjének lokális fallbackje.
      *

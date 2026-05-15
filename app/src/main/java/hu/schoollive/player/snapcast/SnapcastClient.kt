@@ -205,7 +205,28 @@ class SnapcastClient(
                 delay(200)
                 sendTimeRequest(out)
 
+                // Periodikus snap-TIME re-sync: a kliens-óra (Android system
+                // clock) drift-elhet (mobilon akár 1 sec/óra). A snap-szerverhez
+                // 10 sec-enként frissítjük a serverOffsetMs-t, hogy a multiroom
+                // szinkron (ESP/Android/Linux együtt szóljanak) ne csússzon szét.
+                // A timeSyncJob a connection idejére él; ha a readLoop kilép
+                // (Exception → catch), a finally clear-elt isConnected miatt
+                // a while-loop kilép.
+                val timeSyncJob = scope.launch {
+                    while (running && isConnected) {
+                        delay(10_000L)
+                        if (!running || !isConnected) break
+                        try {
+                            sendTimeRequest(out)
+                        } catch (e: Exception) {
+                            Log.w(TAG, "Periodic TIME re-sync failed: ${e.message}")
+                            break
+                        }
+                    }
+                }
+
                 readLoop(inp, out)
+                timeSyncJob.cancel()
             } catch (e: Exception) {
                 if (running) {
                     Log.w(TAG, "Connection lost: ${e.message}")

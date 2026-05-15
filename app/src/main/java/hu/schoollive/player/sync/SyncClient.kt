@@ -107,6 +107,23 @@ class SyncClient(
 
     private var reconnectDelay = RECONNECT_BASE_MS
 
+    /**
+     * Server-óra → kliens-óra eltolódás (ms). A backend HELLO üzenetében
+     * érkezik `serverNowMs` mezőben; a kliens kiszámolja:
+     *   serverClockOffsetMs = serverNowMs - System.currentTimeMillis()
+     * Aztán minden PLAY üzenet `playAtMs`-ét a server-órán kell értelmezni:
+     *   delayMs = playAtMs - (System.currentTimeMillis() + serverClockOffsetMs)
+     *
+     * Az Android óra gyakran nem NTP-szinkronizált (mobilon több sec-es
+     * eltérés is lehet), és anélkül a HUD/audio dispatch akár 3 sec
+     * csúszással jött az ESP-hez képest.
+     */
+    @Volatile
+    private var serverClockOffsetMs: Long = 0L
+
+    /** Server-időt ad kliens-órán, az offset-tel korrigálva. */
+    private fun serverNow(): Long = System.currentTimeMillis() + serverClockOffsetMs
+
     private val pendingPrepare = mutableMapOf<String, JSONObject>()
 
     private val trustAll = object : X509TrustManager {
@@ -186,6 +203,30 @@ class SyncClient(
                 }.toString()
             )
 
+            // Periodikus TIME_SYNC: 60 sec-enként újra-kérjük a backend
+            // serverNow-t, hogy az NTP-szinkronizálatlan Android-óra drift-jét
+            // (akár 1 sec/óra) folyamatosan korrigáljuk. A serverClockOffsetMs
+            // így friss marad → a HUD/audio dispatch a PLAY playAtMs-én pontosan
+            // azonos időpontban indul minden klienseken (ESP, Android, Linux).
+            scope.launch {
+                while (isConnected) {
+                    delay(60_000L)
+                    if (!isConnected) break
+                    val ws = activeWs ?: break
+                    try {
+                        ws.send(
+                            JSONObject().apply {
+                                put("type", "TIME_SYNC")
+                                put("seq", System.currentTimeMillis())
+                            }.toString()
+                        )
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Periodic TIME_SYNC failed: ${e.message}")
+                        break
+                    }
+                }
+            }
+
             scope.launch(Dispatchers.Main) {
                 onConnected()
             }
@@ -264,11 +305,16 @@ class SyncClient(
                     val unmuted = jsonStringList(json, "unmutedDeviceIds")
                         .ifEmpty { jsonStringList(prepare, "unmutedDeviceIds") }
 
-                    val diffMs = playAtMs - System.currentTimeMillis()
+                    // FONTOS: a playAtMs server-órán, ezért a kliens-órát az
+                    // offset-tel korrigálva (serverNow()) hasonlítjuk össze. NTP-
+                    // szinkronizálatlan Android-óra mellett az offset több sec is
+                    // lehet – e nélkül a HUD/audio 1-3 sec-cel elcsúszott az ESP-hez
+                    // képest.
+                    val diffMs = playAtMs - serverNow()
 
                     Log.d(
                         TAG,
-                        "PLAY: action=$prepAction diffMs=${diffMs}ms dur=${durationMs}ms unmuted=${unmuted.size}"
+                        "PLAY: action=$prepAction diffMs=${diffMs}ms dur=${durationMs}ms unmuted=${unmuted.size} offset=$serverClockOffsetMs"
                     )
 
                     if (diffMs < -10_000L) {
@@ -366,16 +412,90 @@ class SyncClient(
                                 Log.d(TAG, "SYNC_BELLS push – bell refresh")
                                 onSyncBells()
                             }
+
+                            // Backend audio-mixer onSourceStart event –
+                            // a HUD-ot frissítjük az aktuálisan szóló forrás
+                            // info-jával. Erre nem indul új audio playback
+                            // a kliens-side-on (a snap stream folyamatos), csak
+                            // a UI-overlay-t állítjuk be – különösen fontos a
+                            // forrás-csere + resume esetén (pl. TTS megszakítja
+                            // a netrádiót, TTS lejár, RADIO resume → most már
+                            // megjelenik a HUD a "Internetrádió" névvel).
+                            "NOW_PLAYING_INFO" -> {
+                                val jobType    = json.optString("jobType", "")
+                                val title      = json.optString("title", "")
+                                val sourceType = json.optString("sourceType", "")
+                                Log.d(
+                                    TAG,
+                                    "NOW_PLAYING_INFO: $jobType '$title' (source=$sourceType)"
+                                )
+                                when (jobType) {
+                                    "BELL" -> onBell(
+                                        BellEvent(
+                                            soundFile = title,
+                                            playAtMs = System.currentTimeMillis(),
+                                            durationMs = durationMs,
+                                            snapActive = true,
+                                            unmutedDeviceIds = emptyList(),
+                                        )
+                                    )
+                                    "TTS" -> onTts(
+                                        TtsEvent(
+                                            text = "",
+                                            title = if (title.isNotEmpty()) title else "Hangos közlemény",
+                                            playAtMs = System.currentTimeMillis(),
+                                            durationMs = durationMs,
+                                            snapActive = true,
+                                            unmutedDeviceIds = emptyList(),
+                                        )
+                                    )
+                                    "RADIO" -> onRadio(
+                                        RadioEvent(
+                                            title = if (title.isNotEmpty()) title else "Iskolarádió",
+                                            snapActive = true,
+                                            unmutedDeviceIds = emptyList(),
+                                        )
+                                    )
+                                }
+                            }
                         }
                     }
                 }
 
                 type == "HELLO" -> {
-                    Log.d(TAG, "HELLO deviceId=${json.optString("deviceId")}")
+                    // Kliens-óra eltolódás kiszámolása a server-órához képest.
+                    // serverClockOffsetMs = serverNowMs - localNow.
+                    // Egy kis hálózati one-way latency-t (50-100ms) elhanyagolunk:
+                    // a snap audio cross-sync úgyis pontosabb (TIME_SYNC alkalmas
+                    // finomításra).
+                    val serverNowMs = json.optLong("serverNowMs", 0L)
+                    if (serverNowMs > 0) {
+                        serverClockOffsetMs = serverNowMs - System.currentTimeMillis()
+                        Log.d(TAG, "HELLO deviceId=${json.optString("deviceId")} clockOffsetMs=$serverClockOffsetMs")
+                    } else {
+                        Log.d(TAG, "HELLO deviceId=${json.optString("deviceId")} (no serverNowMs)")
+                    }
                 }
 
                 type == "TIME_SYNC_RESPONSE" -> {
-                    Log.d(TAG, "TIME_SYNC ok")
+                    // Finomítás: TIME_SYNC kérés → response. A serverNow visszajött,
+                    // és az RTT/2-t hozzáadjuk (one-way latency közelítés).
+                    try {
+                        val serverNowIso = json.optString("serverNow", "")
+                        if (serverNowIso.isNotEmpty()) {
+                            // ISO string parsing (lenient)
+                            val serverNowMs = ISO_FORMAT.parse(serverNowIso)?.time ?: 0L
+                            if (serverNowMs > 0) {
+                                // Az RTT becsléséhez egy kliens-seq-t lehetne küldeni;
+                                // itt a serverNow ~= now + one-way. Half-RTT korrekció
+                                // nélkül is jobb mint az ős-offset.
+                                serverClockOffsetMs = serverNowMs - System.currentTimeMillis()
+                                Log.d(TAG, "TIME_SYNC clockOffsetMs=$serverClockOffsetMs")
+                            }
+                        }
+                    } catch (e: Exception) {
+                        Log.w(TAG, "TIME_SYNC parse error: ${e.message}")
+                    }
                 }
             }
         } catch (e: Exception) {
