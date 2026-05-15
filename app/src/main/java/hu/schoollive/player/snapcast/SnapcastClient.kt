@@ -731,9 +731,13 @@ class SnapcastClient(
         } catch (e: Exception) {
             // ignore – fallback alább
         }
-        // Fallback: a buffer-méret kb-i latency-je (kisebb puffer = kisebb latency).
-        // A kisebb-puffer + LOW_LATENCY mode-ban tipikusan 20-50ms.
-        return 40L
+        // Fallback: tipikus Android AudioTrack DAC-output latency a kisebb-
+        // puffer + LOW_LATENCY mode-ban. A 60ms egy kompromisszum:
+        //  - LOW_LATENCY-támogató eszközön ~30-50ms a valós érték
+        //  - normál mode-ban ~80-120ms
+        //  - 60ms egy középérték, ami a getTimestamp() pontos érték előtt
+        //    (első néhány chunk) is reálisan közelít
+        return 60L
     }
 
     private fun initAudioTrack() {

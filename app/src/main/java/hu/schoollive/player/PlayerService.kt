@@ -17,9 +17,16 @@ import hu.schoollive.player.sync.RadioEvent
 import hu.schoollive.player.sync.SyncClient
 import hu.schoollive.player.sync.TtsEvent
 import hu.schoollive.player.ui.BellManager
+import hu.schoollive.player.util.OtaCheckWorker
 import hu.schoollive.player.util.OtaManager
 import hu.schoollive.player.util.PrefsUtil
+import androidx.work.Constraints
+import androidx.work.ExistingPeriodicWorkPolicy
+import androidx.work.NetworkType
+import androidx.work.PeriodicWorkRequestBuilder
+import androidx.work.WorkManager
 import kotlinx.coroutines.*
+import java.util.concurrent.TimeUnit
 
 private const val TAG = "PlayerService"
 private const val NOTIF_CHANNEL             = "schoollive_player"
@@ -85,6 +92,7 @@ class PlayerService : Service() {
         scope.launch { beaconLoop() }
         scope.launch { bellRefreshLoop() }
         checkOtaInBackground()
+        scheduleOtaPeriodicCheck()
         return START_STICKY
     }
 
@@ -151,18 +159,20 @@ class PlayerService : Service() {
 
                 onBell = { event ->
                     bellManager?.registerBell()
-                    applyTargeting(event.unmutedDeviceIds, event.durationMs)
-                    onBell?.invoke(event)
+                    // HUD-megjelenítés CSAK ha a kliens célzott. Nem célzott
+                    // klienseken eddig megjelent a HUD, pedig a hang nem szólt.
+                    val targeted = applyTargeting(event.unmutedDeviceIds, event.durationMs)
+                    if (targeted) onBell?.invoke(event)
                 },
 
                 onTts   = { event ->
-                    applyTargeting(event.unmutedDeviceIds, event.durationMs)
-                    onTts?.invoke(event)
+                    val targeted = applyTargeting(event.unmutedDeviceIds, event.durationMs)
+                    if (targeted) onTts?.invoke(event)
                 },
                 onRadio = { event ->
                     // Rádiónál nincs durationMs → STOP_PLAYBACK-ig unmuted marad
-                    applyTargeting(event.unmutedDeviceIds, null)
-                    onRadio?.invoke(event)
+                    val targeted = applyTargeting(event.unmutedDeviceIds, null)
+                    if (targeted) onRadio?.invoke(event)
                 },
                 onStop  = {
                     // Lejátszás vége → minden esetben visszanémítjuk a snap kimenetet.
@@ -236,9 +246,15 @@ class PlayerService : Service() {
      *  az `unmutedDeviceIds` listában, oldjuk a némítást a lejátszás idejére.
      *  Ha durationMs ismert (BELL/TTS), automatikusan visszanémítjuk; rádiónál
      *  STOP_PLAYBACK-ig nyitva marad. */
-    private fun applyTargeting(unmutedDeviceIds: List<String>, durationMs: Long?) {
+    /**
+     * Visszatérési érték: true ha a kliens célzott (vagy "uncertain" – akkor
+     * is szól), false ha biztosan NEM célzott. A HUD/overlay megjelenítését
+     * is ennek alapján szabályozzuk – ha false, a hívó NE invoke-olja a
+     * HUD-callback-et (lásd onBell/onTts/onRadio).
+     */
+    private fun applyTargeting(unmutedDeviceIds: List<String>, durationMs: Long?): Boolean {
         val myId = PrefsUtil.getDeviceId(applicationContext)
-        val sc   = snapClient ?: return
+        val sc   = snapClient ?: return true
 
         // Mute-ot CSAK akkor alkalmazunk, ha:
         //   1. A saját device.id ismert (nem üres)
@@ -255,13 +271,13 @@ class PlayerService : Service() {
         remuteJob?.cancel(); remuteJob = null
 
         if (certainlyNotTargeted) {
-            // Biztosan nem célzott → néma
+            // Biztosan nem célzott → néma + HUD-ot sem mutatunk
             sc.setLocalMute(true)
-            Log.d(TAG, "Targeting: NEM célzott (myId=$myId), snap localMuted=true")
-            return
+            Log.d(TAG, "Targeting: NEM célzott (myId=$myId), snap localMuted=true, HUD skip")
+            return false
         }
 
-        // Célzott, vagy uncertain (ID hiányzik / lista üres) → szól
+        // Célzott, vagy uncertain (ID hiányzik / lista üres) → szól + HUD megy
         sc.setLocalMute(false)
         Log.d(TAG, "Targeting: célzott vagy unknown (myId=${myId.ifEmpty{"N/A"}}), snap localMuted=false, dur=$durationMs")
 
@@ -276,6 +292,7 @@ class PlayerService : Service() {
                 }
             }
         }
+        return true
     }
 
     // ── Beacon ────────────────────────────────────────────────────────────────
@@ -372,6 +389,37 @@ class PlayerService : Service() {
             } catch (e: Exception) {
                 Log.w(TAG, "OTA check error: ${e.message}")
             }
+        }
+    }
+
+    // 6 óránként periodikus GitHub Releases ellenőrzés WorkManager-rel.
+    // A `KEEP` policy biztosítja, hogy szolgáltatás-újraindításkor (pl.
+    // a rendszer START_STICKY-vel feléleszti) ne ütemezzük újra a már
+    // futó periodikus munkát – a meglévő ütemezés megmarad.
+    //
+    // A `NetworkType.CONNECTED` constraint miatt csak akkor fut, ha van
+    // hálózat – Wi-Fi szakadáskor nem pörög feleslegesen.
+    //
+    // Pár: a `checkOtaInBackground()` (10 s indítás-utáni egyszeri check)
+    // megmarad, mert az induló kliens azonnal megkapja a friss verziót;
+    // a periodikus worker pedig a 24/7 üzemelő eszközöknél biztosítja,
+    // hogy a service-restart nélkül is eljusson a frissítés.
+    private fun scheduleOtaPeriodicCheck() {
+        try {
+            val constraints = Constraints.Builder()
+                .setRequiredNetworkType(NetworkType.CONNECTED)
+                .build()
+            val request = PeriodicWorkRequestBuilder<OtaCheckWorker>(6, TimeUnit.HOURS)
+                .setConstraints(constraints)
+                .build()
+            WorkManager.getInstance(applicationContext).enqueueUniquePeriodicWork(
+                "schoollive-ota-check",
+                ExistingPeriodicWorkPolicy.KEEP,
+                request
+            )
+            Log.d(TAG, "Periodikus OTA check ütemezve (6h, NETWORK_CONNECTED)")
+        } catch (e: Exception) {
+            Log.w(TAG, "Periodikus OTA ütemezés hiba: ${e.message}")
         }
     }
 

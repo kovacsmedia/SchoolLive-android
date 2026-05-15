@@ -54,6 +54,14 @@ dependencies {
     implementation 'com.google.android.material:material:1.11.0'
     implementation 'androidx.constraintlayout:constraintlayout:2.1.4'
 
+    // WorkManager – periodikus háttérfeladat az OTA frissítés-ellenőrzéshez.
+    // A `PlayerService` indításkor (10 s után) egyszer is megnézi a GitHub
+    // Releases-t, de a 24/7 üzemelő eszközöknél az induláskori check sosem
+    // futna újra; ezért WorkManager-rel 6 óránként újra ellenőrizzük az új
+    // verziót (NETWORK_CONNECTED constraint, unique work policy=KEEP, hogy
+    // szolgáltatás-újraindításkor ne dobja el a már ütemezett munkát).
+    implementation 'androidx.work:work-runtime-ktx:2.9.1'
+
     implementation 'com.squareup.okhttp3:okhttp:4.12.0'
     implementation 'com.squareup.okhttp3:logging-interceptor:4.12.0'
     implementation 'com.squareup.retrofit2:retrofit:2.9.0'
