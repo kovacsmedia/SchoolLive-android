@@ -24,6 +24,14 @@ import java.util.concurrent.ArrayBlockingQueue
 
 private const val TAG = "SnapcastClient"
 
+// AudioTrack DAC-output latency kompenzáció (audioTrackOutputLatencyMs).
+// Az ESP I2S DAC tipikus latency-je 30-40 ms; ezzel illesztve a multiroom-
+// szinkron közelítően jó. Ha az Android előre csúszik az ESP-hez képest,
+// CSÖKKENTSD (pl. 20-30); ha az ESP marad le az Androidhoz képest, NÖVELD
+// (pl. 60-80). A snap-szerver 1 sec pufferében az eltérés elnyelődik –
+// pár-tíz ms-os eltérés nem hallható, de 100+ ms már igen.
+private const val LATENCY_FALLBACK_MS = 40L
+
 private const val RECONNECT_DELAY_MS = 3_000L
 
 private const val TYPE_CODEC_HEADER = 1
@@ -711,43 +719,23 @@ class SnapcastClient(
 
     // ── AudioTrack ────────────────────────────────────────────────────────
 
-    @Suppress("DEPRECATION")
     /**
-     * AudioTrack tényleges DAC-output latency becslés ms-ben. Két forrás:
-     *   - Android Q+ AudioTrack.getTimestamp() (precíz hardware timestamp)
-     *   - Fallback: buffer-size + minBufferSize alapján durva becslés
+     * AudioTrack tényleges DAC-output latency közelítés ms-ben.
      *
-     * A snap multiroom-szinkronhoz lényeges: a track.write() után még X ms
-     * múlva szól a hangszórón – ezzel kell előbbre ütemezni a kezdést.
+     * KORÁBBI HIBÁS implementáció: a getTimestamp() ág `playbackHeadPosition`-t
+     * használt "written" frame-számként, pedig az a **lejátszott** frame-ek
+     * száma. A különbség (`playbackHeadPosition - ts.framePosition`) így a két
+     * getTimestamp-hívás között eltelt frame-ek száma → ms-ben pár-tíz ms,
+     * NEM a tényleges puffer-mélység. Ennek eredménye: a kompenzáció gyakran
+     * alulbecsülte a valós latency-t → az Android előre csúszott az ESP-hez
+     * képest, ami különösen feltűnő volt RADIO-streamnél.
+     *
+     * MOST: fix `LATENCY_FALLBACK_MS` konstans (file-szinten), az ESP I2S DAC
+     * tipikus latency-jéhez illesztve. A snap-szerver 1 sec pufferében ez
+     * elnyelődik, a két platform közelítő szinkronban szól. Hangoláshoz
+     * a fájl tetején lévő konstanst változtatni elég.
      */
-    private fun audioTrackOutputLatencyMs(): Long {
-        val track = audioTrack ?: return 0L
-        try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-                val ts = android.media.AudioTimestamp()
-                if (track.getTimestamp(ts)) {
-                    val now = System.nanoTime()
-                    // ts.nanoTime: amikor a ts.framePosition frame szólalt meg
-                    // a DAC-on. A puffer-mélységet ettől visszafelé számoljuk.
-                    val written = track.playbackHeadPosition.toLong()
-                    val framesAhead = written - ts.framePosition
-                    if (framesAhead > 0 && sampleRate > 0) {
-                        val latencyMs = framesAhead * 1000L / sampleRate
-                        return latencyMs.coerceIn(0L, 500L)
-                    }
-                }
-            }
-        } catch (e: Exception) {
-            // ignore – fallback alább
-        }
-        // Fallback: tipikus Android AudioTrack DAC-output latency a kisebb-
-        // puffer + LOW_LATENCY mode-ban. A 60ms egy kompromisszum:
-        //  - LOW_LATENCY-támogató eszközön ~30-50ms a valós érték
-        //  - normál mode-ban ~80-120ms
-        //  - 60ms egy középérték, ami a getTimestamp() pontos érték előtt
-        //    (első néhány chunk) is reálisan közelít
-        return 60L
-    }
+    private fun audioTrackOutputLatencyMs(): Long = LATENCY_FALLBACK_MS
 
     private fun initAudioTrack() {
         releaseAudioTrack()
