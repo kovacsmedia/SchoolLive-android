@@ -86,15 +86,25 @@ private fun jsonStringList(json: JSONObject, key: String): List<String> {
 /**
  * NOW_PLAYING_INFO esemény – a backend `audio-mixer onSourceStart` push-ja.
  * Forrás-csere (pl. TTS megszakítja a rádiót → TTS vége → RADIO resume) után
- * a HUD-frissítéshez használjuk. NEM tartalmaz targeting-listát (a backend
- * minden tenant-eszközre broadcast-olja), ezért a kliens dönt arról saját
- * localMuted állapota alapján, hogy ténylegesen mutat-e HUD-ot.
+ * a HUD-frissítéshez használjuk.
+ *
+ * - `title`: rövid kontextus (radio név, "Csengetés HH:MM", TTS első ~200
+ *   karaktere ékezetesen)
+ * - `text`: TTS-nél a TELJES felolvasandó szöveg, ékezetekkel; null bell/
+ *   radio-nál (a `title` használandó helyette)
+ * - `targetDeviceIds`: az aktuális forrás-célzás listája. Ha null → minden
+ *   eszköz célzott (ALL). A kliens ezt használja az újra-targeteléshez:
+ *   ha forrás-csere során most már célzott, oldja a localMute-ot; ha nem,
+ *   fenntartja. (Forrás-csere belül a snap-server újratargetel, de a kliens
+ *   localMute flag-jét is el kell igazítani.)
  */
 data class NowPlayingInfo(
     val jobType: String,    // "BELL" | "TTS" | "RADIO"
     val title: String,
+    val text: String?,
     val sourceType: String,
     val durationMs: Long?,
+    val targetDeviceIds: List<String>?,
 )
 
 class SyncClient(
@@ -104,6 +114,12 @@ class SyncClient(
     private val onRadio: (RadioEvent) -> Unit = {},
     private val onStop: () -> Unit = {},
     private val onSyncBells: () -> Unit = {},
+    // Eszköz-szintű remote parancsok: SET_VOLUME (volume 0..10) és MUTE
+    // (muted bool). A backend `createDeviceCommand` WS-en is kiküldi targeted
+    // módon. Linux/Windows ugyanezt /devices/poll-on át kapja, az Android
+    // kliens NEM poll-oz – csak WS-en kommunikál → eddig nem kapta meg.
+    private val onSetVolume: (Int) -> Unit = {},
+    private val onMute: (Boolean) -> Unit = {},
     private val onConnected: () -> Unit = {},
     private val onDisconnected: () -> Unit = {},
     // NOW_PLAYING_INFO push (forrás-csere HUD-frissítés). A kliensnek itt
@@ -425,6 +441,30 @@ class SyncClient(
 
                             "STOP_PLAYBACK" -> onStop()
 
+                            // Eszköz-szintű volume parancs a backend admin
+                            // UI-ról (slider / mute gomb / global mute /
+                            // global max). Volume 0..10 skála, a PlayerService
+                            // bekapcsolja a snap stream-volume-ot.
+                            "SET_VOLUME" -> {
+                                val vol = json.optInt("volume", -1)
+                                if (vol in 0..10) {
+                                    Log.d(TAG, "SET_VOLUME → $vol")
+                                    onSetVolume(vol)
+                                } else {
+                                    Log.w(TAG, "SET_VOLUME érvénytelen volume=$vol")
+                                }
+                            }
+
+                            // Eszköz-szintű MUTE parancs (külön a SET_VOLUME-tól).
+                            // A frontend admin UI jelenleg SET_VOLUME 0-t küld
+                            // a némítás gombra, de a MUTE action is támogatott
+                            // a Linux/Windows device_agent-tel egyezően.
+                            "MUTE" -> {
+                                val muted = json.optBoolean("mute", true)
+                                Log.d(TAG, "MUTE → $muted")
+                                onMute(muted)
+                            }
+
                             // Bell szinkron push – azonnal frissít.
                             "SYNC_BELLS" -> {
                                 Log.d(TAG, "SYNC_BELLS push – bell refresh")
@@ -442,26 +482,37 @@ class SyncClient(
                             "NOW_PLAYING_INFO" -> {
                                 val jobType    = json.optString("jobType", "")
                                 val title      = json.optString("title", "")
+                                val text       = json.optString("text").takeIf { it.isNotEmpty() }
                                 val sourceType = json.optString("sourceType", "")
+                                // targetDeviceIds: null/hiányzó → minden eszköz célzott
+                                // (ALL); üres lista vagy konkrét id-lista → szigorú
+                                // szűkítés. A JSON parsing miatt itt a kettőt el kell
+                                // különíteni: a backend explicit null-t küld minden-
+                                // re-célzáskor (lásd `jobTargets.get(jobId) ?? null`).
+                                val tIds: List<String>? = if (json.isNull("targetDeviceIds")) {
+                                    null
+                                } else {
+                                    jsonStringList(json, "targetDeviceIds")
+                                }
                                 Log.d(
                                     TAG,
-                                    "NOW_PLAYING_INFO: $jobType '$title' (source=$sourceType)"
+                                    "NOW_PLAYING_INFO: $jobType '$title' (source=$sourceType, targets=${tIds?.size ?: "ALL"})"
                                 )
                                 // FONTOS: NE onBell/onTts/onRadio-t hívjunk – azok a
-                                // PREPARE/PLAY flow eseményei, célzás-listával jönnek.
-                                // A NOW_PLAYING_INFO célzás nélküli broadcast (a backend
-                                // source:start eventjén megy ki minden tenant-eszközre),
-                                // ezért ha az `applyTargeting`-on át mennénk, az üres
-                                // unmutedDeviceIds miatt mindig HUD-ot mutatna – akkor is,
-                                // ha az eszköz nem célzott.
-                                // Helyette külön callback (`onNowPlayingInfo`), és a
-                                // PlayerService a snapClient.isLocalMuted() alapján
-                                // dönt arról, hogy mutat-e HUD-ot.
+                                // PREPARE/PLAY flow eseményei, és a NOW_PLAYING_INFO
+                                // saját targeting-listát + szöveget hoz. A PlayerService
+                                // a `onNowPlayingInfo` callback-en fogadja, és újra-
+                                // targeteli a snap streamet a `targetDeviceIds` alapján,
+                                // így a forrás-csere (pl. TTS→radio resume) után a
+                                // korábban muted kliens is feloldódhat, ha az új forrás
+                                // ránk irányul.
                                 onNowPlayingInfo(NowPlayingInfo(
-                                    jobType    = jobType,
-                                    title      = title,
-                                    sourceType = sourceType,
-                                    durationMs = durationMs,
+                                    jobType         = jobType,
+                                    title           = title,
+                                    text            = text,
+                                    sourceType      = sourceType,
+                                    durationMs      = durationMs,
+                                    targetDeviceIds = tIds,
                                 ))
                             }
                         }

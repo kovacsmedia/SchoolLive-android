@@ -180,15 +180,39 @@ class PlayerService : Service() {
                     snapClient?.setLocalMute(true)
                     onStop?.invoke()
                 },
-                // NOW_PLAYING_INFO: forrás-csere broadcast. NEM tartalmaz célzás-
-                // listát, ezért nem mehet az applyTargeting-on. Helyette a snap
-                // kliens localMuted-jét nézzük: ha NEM néma, akkor a kliens hallja
-                // az audiót → HUD-ot is mutatunk. Ha néma, akkor nem szól → nincs
-                // HUD. A `unmutedDeviceIds = emptyList()` placeholder marad, mert
-                // a fogadó oldali HUD overlay nem nézi (csak a meta-adatokat).
+                // Backend SET_VOLUME (admin UI slider / mute gomb): a kapott
+                // 0..10 érték a snap stream lokális hangerejére hat.
+                // A SnapcastClient.setVolume 0..100 skálát vár, ezért × 10.
+                // (A média notification UI tvVolume frissítését nem itt
+                // csináljuk – a MainActivity figyel beacon-állapot frissítésre.)
+                onSetVolume = { vol ->
+                    val percent = (vol * 10).coerceIn(0, 100)
+                    Log.d(TAG, "Backend SET_VOLUME → $percent%")
+                    snapClient?.setVolume(percent)
+                },
+                // Backend MUTE: localMute toggle a snap streamre. Unmute után
+                // a userVolume visszaáll (SnapcastClient kezeli a tárolt értéket).
+                onMute = { muted ->
+                    Log.d(TAG, "Backend MUTE → $muted")
+                    snapClient?.setLocalMute(muted)
+                },
+                // NOW_PLAYING_INFO: forrás-csere broadcast az audio-mixer
+                // `source:start` eventjén. A payload mostantól tartalmazza:
+                //   • text  – TTS-nél a teljes felolvasandó szöveg ékezetekkel
+                //   • targetDeviceIds – az új forrás célzása (null = ALL)
+                //
+                // A célzást ÚJRA alkalmazzuk a snap-streamre (a backend snap-
+                // szervere ezt amúgy is megtette per-client RPC-vel, de a
+                // kliens localMute flag-jét is el kell igazítanunk, hogy a
+                // korábbi PREPARE-en megszerzett mute állapot helyett az új
+                // forrás célzását tükrözze). Ha az új célzás KIzár minket,
+                // localMute aktív marad + HUD skip. Ha BENNE vagyunk vagy
+                // ALL, localMute fel + HUD megy.
                 onNowPlayingInfo = { info ->
-                    if (snapClient?.isLocalMuted() == true) {
-                        Log.d(TAG, "NOW_PLAYING_INFO ${info.jobType}: localMuted=true → HUD skip")
+                    val unmutedIds = info.targetDeviceIds ?: emptyList()
+                    val targeted   = applyTargeting(unmutedIds, info.durationMs)
+                    if (!targeted) {
+                        Log.d(TAG, "NOW_PLAYING_INFO ${info.jobType}: nem célzott → HUD skip")
                         return@SyncClient
                     }
                     val now = System.currentTimeMillis()
@@ -198,20 +222,24 @@ class PlayerService : Service() {
                             playAtMs         = now,
                             durationMs       = info.durationMs,
                             snapActive       = true,
-                            unmutedDeviceIds = emptyList(),
+                            unmutedDeviceIds = unmutedIds,
                         ))
                         "TTS" -> onTts?.invoke(TtsEvent(
-                            text             = "",
+                            // TTS-nél a `text` mező a felolvasott teljes szöveg
+                            // (ékezetekkel), a `title` a rövid kontextus. A HUD
+                            // overlay a text-et részesíti előnyben (lásd
+                            // MainActivity); fallback a title-re ha üres.
+                            text             = info.text ?: "",
                             title            = if (info.title.isNotEmpty()) info.title else "Hangos közlemény",
                             playAtMs         = now,
                             durationMs       = info.durationMs,
                             snapActive       = true,
-                            unmutedDeviceIds = emptyList(),
+                            unmutedDeviceIds = unmutedIds,
                         ))
                         "RADIO" -> onRadio?.invoke(RadioEvent(
                             title            = if (info.title.isNotEmpty()) info.title else "Iskolarádió",
                             snapActive       = true,
-                            unmutedDeviceIds = emptyList(),
+                            unmutedDeviceIds = unmutedIds,
                         ))
                     }
                 },
