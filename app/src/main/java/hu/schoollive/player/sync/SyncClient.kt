@@ -120,6 +120,12 @@ class SyncClient(
     // kliens NEM poll-oz – csak WS-en kommunikál → eddig nem kapta meg.
     private val onSetVolume: (Int) -> Unit = {},
     private val onMute: (Boolean) -> Unit = {},
+    // Manuális szinkron-eltolás (ms). A backend `Device.syncOffsetMs` mező
+    // alapján: csatlakozáskor a HELLO-ban érkezik, futás közben pedig a
+    // SET_SYNC_OFFSET action push-olja a frontendről történő PATCH után.
+    // A PlayerService a SnapcastClient sync-loop-jába vezeti, így a kliens
+    // hallás-alapján finomhangolható.
+    private val onSyncOffset: (Long) -> Unit = {},
     private val onConnected: () -> Unit = {},
     private val onDisconnected: () -> Unit = {},
     // NOW_PLAYING_INFO push (forrás-csere HUD-frissítés). A kliensnek itt
@@ -465,6 +471,17 @@ class SyncClient(
                                 onMute(muted)
                             }
 
+                            // Manuális szinkron-eltolás (frontend Devices →
+                            // Részletek overlay-ből PATCH után). A SnapcastClient
+                            // sync-loop-jában a desiredStartMs-hez hozzáadódik,
+                            // így a kliens audio előrébb (-) vagy hátrébb (+)
+                            // csúszik 10 ms-os lépésekben.
+                            "SET_SYNC_OFFSET" -> {
+                                val offset = json.optLong("offsetMs", 0L)
+                                Log.d(TAG, "SET_SYNC_OFFSET → ${offset}ms")
+                                onSyncOffset(offset)
+                            }
+
                             // Bell szinkron push – azonnal frissít.
                             "SYNC_BELLS" -> {
                                 Log.d(TAG, "SYNC_BELLS push – bell refresh")
@@ -531,6 +548,14 @@ class SyncClient(
                         Log.d(TAG, "HELLO deviceId=${json.optString("deviceId")} clockOffsetMs=$serverClockOffsetMs")
                     } else {
                         Log.d(TAG, "HELLO deviceId=${json.optString("deviceId")} (no serverNowMs)")
+                    }
+                    // Manuális szinkron-eltolás csatlakozáskor (Device.syncOffsetMs
+                    // a backend DB-ben). A SnapcastClient sync-loop-jába vezeti
+                    // a PlayerService.
+                    if (json.has("syncOffsetMs")) {
+                        val offset = json.optLong("syncOffsetMs", 0L)
+                        Log.d(TAG, "HELLO syncOffsetMs=${offset}ms")
+                        onSyncOffset(offset)
                     }
                 }
 

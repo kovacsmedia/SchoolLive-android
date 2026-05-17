@@ -196,6 +196,14 @@ class PlayerService : Service() {
                     Log.d(TAG, "Backend MUTE → $muted")
                     snapClient?.setLocalMute(muted)
                 },
+                // Manuális szinkron-eltolás (Device.syncOffsetMs backend DB).
+                // HELLO-ban (csatlakozás), és a SET_SYNC_OFFSET action-ben
+                // (frontend PATCH-elés után) érkezik. A SnapcastClient
+                // sync-loop-jában alkalmazódik a köv. chunk-tól.
+                onSyncOffset = { offsetMs ->
+                    Log.d(TAG, "Backend SET_SYNC_OFFSET → ${offsetMs}ms")
+                    snapClient?.setSyncOffset(offsetMs)
+                },
                 // NOW_PLAYING_INFO: forrás-csere broadcast az audio-mixer
                 // `source:start` eventjén. A payload mostantól tartalmazza:
                 //   • text  – TTS-nél a teljes felolvasandó szöveg ékezetekkel

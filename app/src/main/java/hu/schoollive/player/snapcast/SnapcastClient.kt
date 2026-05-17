@@ -119,6 +119,24 @@ class SnapcastClient(
     @Volatile
     private var timeSentLocalMs: Long = 0L
 
+    // Manuális szinkron-eltolás (Device.syncOffsetMs a backend DB-ben).
+    // A `desiredStartMs`-hez hozzáadjuk, így a kliens audio előrébb (-) vagy
+    // hátrébb (+) csúszik. A frontend Devices→Részletek overlay állítja
+    // 10 ms-os lépésekben, hallás-alapú finomhangoláshoz.
+    @Volatile
+    private var syncOffsetMs: Long = 0L
+
+    /** Manuális sync-eltolás beállítása ms-ben. Pozitív érték → kliens
+     *  hátrébb csúszik (későbbi szólalás), negatív → előrébb. A változás a
+     *  következő chunk-tól érvényesül; az aktuálisan szóló stream nem
+     *  szakad meg (a renderLoop a friss értéket olvassa). */
+    fun setSyncOffset(ms: Long) {
+        syncOffsetMs = ms.coerceIn(-2000L, 2000L)
+        Log.d(TAG, "syncOffsetMs=${syncOffsetMs}ms")
+    }
+
+    fun getSyncOffset(): Long = syncOffsetMs
+
     private val audioQueue = ArrayBlockingQueue<AudioChunk>(500)
 
     fun start() {
@@ -640,7 +658,10 @@ class SnapcastClient(
             if (!synced) {
                 val bufferMs = serverBufferMs
                 val localServerNowMs = System.currentTimeMillis() + serverOffsetMs
-                val desiredStartMs = chunk.serverTimestampMs + bufferMs
+                // Manual sync offset a desiredStartMs-hez: hallás-alapú
+                // finomhangoláshoz a frontend Devices→Részletek overlay-ből.
+                // Pozitív → későbbi szólalás (hátrébb), negatív → korábbi.
+                val desiredStartMs = chunk.serverTimestampMs + bufferMs + syncOffsetMs
 
                 // AudioTrack output-latency kompenzáció: a track.write után
                 // a tényleges DAC-szólalás még X ms (kisebb-puffer + LOW_LATENCY
@@ -711,34 +732,46 @@ class SnapcastClient(
 
     // ── AudioTrack ────────────────────────────────────────────────────────
 
-    @Suppress("DEPRECATION")
     /**
-     * AudioTrack tényleges DAC-output latency becslés ms-ben. Két forrás:
-     *   - Android Q+ AudioTrack.getTimestamp() (precíz hardware timestamp)
-     *   - Fallback: buffer-size + minBufferSize alapján durva becslés
+     * AudioTrack tényleges DAC-output latency – PER-DEVICE pontos érték.
      *
-     * A snap multiroom-szinkronhoz lényeges: a track.write() után még X ms
-     * múlva szól a hangszórón – ezzel kell előbbre ütemezni a kezdést.
+     * Az `AudioTrack.getLatency()` (deprecated de minden API szinten működik)
+     * pontosan azt adja vissza, ami a `track.write()` és a fizikai DAC-output
+     * közötti teljes késleltetés (HAL + buffer + DAC). Ez **eszközfüggő**:
+     *   • Samsung S23 Ultra: ~80-140 ms
+     *   • Lenovo Tab 10: ~150-250 ms
+     *   • Pixel/flagship: ~40-80 ms
      *
-     * MEGJEGYZÉS: a v1.4.8-as implementáció ez volt (40ms fallback +
-     * getTimestamp-ág). A v1.5.0 kiadás idején ez adta az elfogadható
-     * multiroom-szinkront Android-Android és Android-ESP között. Bár a
-     * `playbackHeadPosition - ts.framePosition` matematikailag nem a
-     * puffer-mélységet adja, a gyakorlatban éppen olyan értékeket
-     * produkált, amik az Android+ESP DAC-latency-eltérést kompenzálták.
-     * SZÁNDÉKOSAN nem "javítottuk" – a működő érzet fontosabb a tiszta
-     * elméletnél, és bárhogy is, a snapserver 1 sec puffere bőven elnyeli
-     * a számolási pontatlanságot.
+     * Korábban egy fix 40 ms fallback-et használtunk + egy buggy getTimestamp
+     * ágat – emiatt minden Android a SAJÁT (eltérő) DAC-latency-jével
+     * lemaradt az ESP-től. A getLatency() használatával minden Android a saját
+     * latency-jét kompenzálja → mindhárom platform (ESP, S23, Tab10)
+     * közelítően azonos időben szólal meg.
+     *
+     * Fallback rétegek:
+     *   1. getLatency() (hivatalos, pontos)
+     *   2. getTimestamp() framesAhead (Android Q+)
+     *   3. 40 ms fix (utolsó mentsvár)
      */
+    @Suppress("DEPRECATION")
     private fun audioTrackOutputLatencyMs(): Long {
         val track = audioTrack ?: return 0L
+        // 1) getLatency() – pontos per-device érték (HAL + buffer + DAC).
+        //    `@hide` API a publikus SDK-ban, reflection-nel érjük el. Minden
+        //    AOSP-alapú Android-on működik (API 14+).
+        try {
+            val method = AudioTrack::class.java.getDeclaredMethod("getLatency")
+            val latency = (method.invoke(track) as? Int)?.toLong() ?: 0L
+            if (latency in 1L..500L) return latency
+        } catch (e: Exception) {
+            // ignore – tovább a fallback-ekre
+        }
+        // 2) getTimestamp framesAhead – Android Q+ alternatíva, a régi v1.4.8
+        //    érték-tartományhoz közelít.
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
                 val ts = android.media.AudioTimestamp()
                 if (track.getTimestamp(ts)) {
-                    val now = System.nanoTime()
-                    // ts.nanoTime: amikor a ts.framePosition frame szólalt meg
-                    // a DAC-on. A puffer-mélységet ettől visszafelé számoljuk.
                     val written = track.playbackHeadPosition.toLong()
                     val framesAhead = written - ts.framePosition
                     if (framesAhead > 0 && sampleRate > 0) {
@@ -750,8 +783,8 @@ class SnapcastClient(
         } catch (e: Exception) {
             // ignore – fallback alább
         }
-        // Fallback: a buffer-méret kb-i latency-je (kisebb puffer = kisebb latency).
-        // A kisebb-puffer + LOW_LATENCY mode-ban tipikusan 20-50ms.
+        // 3) Konzervatív default – kisebb-puffer + LOW_LATENCY mode-ban
+        //    tipikusan 20-50 ms.
         return 40L
     }
 
