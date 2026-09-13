@@ -63,3 +63,8 @@ data class BeaconResponse(
     val ok: Boolean,
     val deviceId: String?
 )
+
+// Multi-node cluster: GET /cluster/locate?tenantId=… válasza.
+data class ClusterLocateResponse(
+    val hostname: String? = null,
+)

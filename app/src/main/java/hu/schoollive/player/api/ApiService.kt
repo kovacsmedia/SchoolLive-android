@@ -29,6 +29,14 @@ interface ApiService {
         @Header("x-device-key") deviceKey: String
     ): Response<TenantInfo>
 
+    // Multi-node cluster: melyik node birtokolja most ezt a tenantot.
+    // Szándékosan hitelesítés nélküli végpont (a backend app.ts-ben) – az
+    // eszköznek pont AZELŐTT kell hívnia, hogy bárhova bejelentkezne.
+    @GET("cluster/locate")
+    suspend fun locateNode(
+        @Query("tenantId") tenantId: String
+    ): Response<ClusterLocateResponse>
+
     @GET("bells/sync")
     suspend fun getBells(
         @Header("x-device-key") deviceKey: String

@@ -33,6 +33,9 @@ private const val NOTIF_CHANNEL             = "schoollive_player"
 private const val NOTIF_ID                  = 1
 private const val BEACON_INTERVAL_MS        = 30_000L
 private const val BELLS_REFRESH_INTERVAL_MS = 300_000L
+// Ennyit várunk a CMD_ACK kiküldése és a tényleges újraindítás között, hogy a
+// nyugta biztosan elhagyja a vonalat (az ESP32 ugyanezt csinálja).
+private const val REBOOT_DELAY_MS           = 1_000L
 
 class PlayerService : Service() {
 
@@ -96,6 +99,30 @@ class PlayerService : Service() {
         return START_STICKY
     }
 
+    /**
+     * Szolgáltatás-újraindítás távoli REBOOT parancsra.
+     *
+     * Androidon nincs "eszköz-újraindítás" jogosultságunk (root nélkül), és
+     * nem is az kell: a cél ugyanaz, mint az ESP32 `ESP.restart()`-jánál –
+     * tiszta lappal induljon újra a lejátszó (WS, snap kliens, csengetés-
+     * állapotgép). Ezért leállítjuk és azonnal újraindítjuk magunkat; a
+     * foreground service-t az OS visszahozza az `onStartCommand` START_STICKY
+     * miatt, de az explicit újraindítás nem hagyja ezt a véletlenre.
+     */
+    private fun restartSelf() {
+        try {
+            val intent = Intent(applicationContext, PlayerService::class.java)
+            stopSelf()
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                applicationContext.startForegroundService(intent)
+            } else {
+                applicationContext.startService(intent)
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "restartSelf hiba: ${e.message}")
+        }
+    }
+
     override fun onDestroy() {
         super.onDestroy()
         snapClient?.stop()
@@ -105,6 +132,54 @@ class PlayerService : Service() {
     }
 
     fun getBellManager(): BellManager? = bellManager
+
+    // ── Multi-node cluster ────────────────────────────────────────────────────
+    //
+    // A tenant átkerülhet egy másik backend-node-ra (rebalancing, vagy a
+    // korábbi node halála). Ilyenkor MINDKÉT kapcsolatot át kell irányítani:
+    // a `/sync` WebSocketet ÉS a snapclientet – utóbbi hostja a
+    // `PrefsUtil.getSnapHost()`-on át szintén a `server_url`-ből származik,
+    // tehát elég a beállítást frissíteni és újracsatlakozni.
+    //
+    // Korábban az Android kliens ezt egyáltalán nem kezelte: rebalancing után
+    // a régi node-ot hívta örökre, azaz némán elnémult (a hang a másik node
+    // snapserverén ment volna).
+    @Volatile
+    private var tenantId: String = ""
+
+    private fun handleNodeReassigned(hostname: String) {
+        scope.launch {
+            val target = if (hostname.isNotEmpty()) hostname else resolveNodeViaLocate()
+            if (target.isNullOrEmpty()) {
+                Log.w(TAG, "Node-váltás jelzés, de nem tudjuk, hova – marad a jelenlegi node")
+                return@launch
+            }
+
+            val ctx     = applicationContext
+            val current = PrefsUtil.getServerUrl(ctx).trimEnd('/')
+            val next    = "https://$target"
+            if (current == next) return@launch   // ping-pong védelem
+
+            Log.i(TAG, "Node-váltás: $current → $next")
+            PrefsUtil.setServerUrl(ctx, next)
+            withContext(Dispatchers.Main) { connectAll() }
+        }
+    }
+
+    /** GET /cluster/locate?tenantId=… – akkor kell, ha 4009-et kaptunk, de
+     *  NODE_REASSIGNED push nem érkezett (a régi node hirtelen meghalt).
+     *  A tenantId a HELLO üzenetből származik. */
+    private suspend fun resolveNodeViaLocate(): String? {
+        val tid = tenantId
+        if (tid.isEmpty()) return null
+        return try {
+            val resp = ApiClient.get(PrefsUtil.getServerUrl(applicationContext)).locateNode(tid)
+            if (resp.isSuccessful) resp.body()?.hostname else null
+        } catch (e: Exception) {
+            Log.w(TAG, "locateNode hiba: ${e.message}")
+            null
+        }
+    }
 
     // ── Connect ───────────────────────────────────────────────────────────────
 
@@ -263,6 +338,20 @@ class PlayerService : Service() {
                     onWsStateChanged?.invoke(false)
                     onWsConnecting?.invoke()
                 },
+                // Soft reset az adminfelületről. A nyugta már kiment (SyncClient),
+                // itt csak a tényleges újraindítás következik – rövid késleltetéssel,
+                // hogy a CMD_ACK biztosan elhagyja a vonalat. Az ESP32 ugyanezt a
+                // mintát követi (DeviceAgent: ACK után `ESP.restart()`).
+                onReboot = {
+                    scope.launch {
+                        delay(REBOOT_DELAY_MS)
+                        Log.d(TAG, "REBOOT: szolgáltatás újraindítása")
+                        restartSelf()
+                    }
+                },
+                // Multi-node cluster – ld. SyncClient azonos nevű paraméterét.
+                onTenantId       = { tid -> tenantId = tid },
+                onNodeReassigned = { host -> handleNodeReassigned(host) },
                 onActivity = { onNetActivity?.invoke() },
             )
             syncClient?.start()

@@ -56,4 +56,18 @@ object PrefsUtil {
     // ── Bells (JSON string cache) ──────────────────────────────────
     fun getBellsJson(ctx: Context) = prefs(ctx).getString("bells_json", "") ?: ""
     fun setBellsJson(ctx: Context, v: String) = prefs(ctx).edit().putString("bells_json", v).apply()
+
+    // ── Elcsengetve-állapot ───────────────────────────────────────────────────
+    // A már lejátszott csengetések ("HH:MM", vesszővel elválasztva) + a nap,
+    // amire vonatkoznak. Azért perzisztens, mert a szolgáltatás újraindulhat
+    // (Android megölheti, OTA, felhasználói újraindítás) – enélkül egy
+    // újraindulás a 120 másodperces pótlási ablakon belül MEGISMÉTELNÉ a
+    // csengetést. Az ESP32 ugyanezt NVS-ben tartja (BellManager saveBellDoneState).
+    fun getBellDoneDay(ctx: Context) = prefs(ctx).getInt("bell_done_day", -1)
+    fun getBellDoneKeys(ctx: Context) = prefs(ctx).getString("bell_done_keys", "") ?: ""
+    fun setBellDone(ctx: Context, day: Int, keys: String) =
+        prefs(ctx).edit()
+            .putInt("bell_done_day", day)
+            .putString("bell_done_keys", keys)
+            .apply()
 }

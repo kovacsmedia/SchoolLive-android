@@ -128,6 +128,21 @@ class SyncClient(
     private val onSyncOffset: (Long) -> Unit = {},
     private val onConnected: () -> Unit = {},
     private val onDisconnected: () -> Unit = {},
+    // Az adminfelület "Újraindítás (soft reset)" gombja. Az ESP32-n
+    // `ESP.restart()`, itt a szolgáltatás újraindítása (ld. PlayerService).
+    private val onReboot: () -> Unit = {},
+    // Multi-node cluster: a tenant másik backend-node-ra került. Két úton
+    // derülhet ki:
+    //   • NODE_REASSIGNED üzenet – a régi (még élő) node küldi, MIELŐTT
+    //     4009-cel bontaná a kapcsolatot; a `hostname` az új node.
+    //   • 4009 close code NODE_REASSIGNED nélkül – a régi node hirtelen
+    //     meghalt; ilyenkor `hostname` üres, és a PlayerService a HELLO-ból
+    //     ismert tenantId-vel a `/cluster/locate`-ből kérdezi meg az újat.
+    // Eddig az Android kliens EGYIKET SEM kezelte: rebalancing után örökre a
+    // régi node-ot hívta (WS és snapclient egyaránt), azaz némán elnémult.
+    private val onNodeReassigned: (String) -> Unit = {},
+    // A saját tenantId a HELLO-ból – a /cluster/locate fallbackhoz kell.
+    private val onTenantId: (String) -> Unit = {},
     // NOW_PLAYING_INFO push (forrás-csere HUD-frissítés). A kliensnek itt
     // KELL a localMuted-et néznie, mert ez a push minden eszközre megy,
     // célzás-listával együtt nem.
@@ -229,6 +244,21 @@ class SyncClient(
         Log.d(TAG, "READY_ACK: $commandId")
     }
 
+    // Parancs-nyugta. Az ESP32 `DeviceAgent` ugyanezt a formátumot küldi
+    // (type=CMD_ACK, commandId, ok) – a backend így tudja lezárni a parancsot.
+    private fun sendCmdAck(commandId: String, ok: Boolean, error: String? = null) {
+        if (commandId.isEmpty()) return
+        activeWs?.send(
+            JSONObject().apply {
+                put("type", "CMD_ACK")
+                put("commandId", commandId)
+                put("ok", ok)
+                if (!ok && error != null) put("error", error)
+            }.toString()
+        )
+        Log.d(TAG, "CMD_ACK: $commandId ok=$ok")
+    }
+
     private val listener = object : WebSocketListener() {
         override fun onOpen(webSocket: WebSocket, response: Response) {
             Log.d(TAG, "WS connected")
@@ -293,6 +323,14 @@ class SyncClient(
 
             isConnected = false
             activeWs = null
+
+            // 4009 = "Tenant not hosted on this node". Ha megelőzte
+            // NODE_REASSIGNED, a PlayerService már át is állt; ha nem (a régi
+            // node hirtelen meghalt), üres hostnévvel jelzünk, és a
+            // PlayerService a /cluster/locate-ből deríti ki az új node-ot.
+            if (code == 4009) {
+                scope.launch(Dispatchers.Main) { onNodeReassigned("") }
+            }
 
             scope.launch(Dispatchers.Main) {
                 onDisconnected()
@@ -482,6 +520,17 @@ class SyncClient(
                                 onSyncOffset(offset)
                             }
 
+                            // Soft reset az adminfelületről (Eszközök →
+                            // Részletek → Újraindítás). A nyugtát MÉG a
+                            // tényleges újraindítás előtt kiküldjük, különben
+                            // a backend "nem válaszolt"-ként zárná le.
+                            "REBOOT" -> {
+                                val commandId = json.optString("commandId", "")
+                                Log.d(TAG, "REBOOT parancs – szolgáltatás újraindítása")
+                                sendCmdAck(commandId, true)
+                                onReboot()
+                            }
+
                             // Bell szinkron push – azonnal frissít.
                             "SYNC_BELLS" -> {
                                 Log.d(TAG, "SYNC_BELLS push – bell refresh")
@@ -536,12 +585,21 @@ class SyncClient(
                     }
                 }
 
+                type == "NODE_REASSIGNED" -> {
+                    val host = json.optString("hostname", "")
+                    Log.i(TAG, "NODE_REASSIGNED → $host")
+                    if (host.isNotEmpty()) onNodeReassigned(host)
+                }
+
                 type == "HELLO" -> {
                     // Kliens-óra eltolódás kiszámolása a server-órához képest.
                     // serverClockOffsetMs = serverNowMs - localNow.
                     // Egy kis hálózati one-way latency-t (50-100ms) elhanyagolunk:
                     // a snap audio cross-sync úgyis pontosabb (TIME_SYNC alkalmas
                     // finomításra).
+                    val tenantId = json.optString("tenantId", "")
+                    if (tenantId.isNotEmpty()) onTenantId(tenantId)
+
                     val serverNowMs = json.optLong("serverNowMs", 0L)
                     if (serverNowMs > 0) {
                         serverClockOffsetMs = serverNowMs - System.currentTimeMillis()
