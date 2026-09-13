@@ -22,10 +22,6 @@ private const val BELL_CATCHUP_MAX_S     = 120L     // ennél régebbit már NEM
 private const val BELL_MATCH_WINDOW_S    = 45L      // PREPARE ↔ bejegyzés párosítás
 private const val MIN_LOCAL_GAP_MS       = 15_000L  // két helyi csengetés közti minimum
 
-// Gyári default hangok – `soundFile` nélküli bejegyzésnél ezek szólnak.
-// A csengetés NEM maradhat el amiatt, mert nincs kiválasztva hang.
-private const val DEFAULT_SIGNAL_SOUND = "jelzocsengo.mp3"
-private const val DEFAULT_MAIN_SOUND   = "kibecsengo.mp3"
 
 class BellManager(private val ctx: Context) {
 
@@ -93,8 +89,13 @@ class BellManager(private val ctx: Context) {
 
     val isOfflineMode: Boolean get() = !(snapOnline && wsOnline)
 
-    // Callback: offline bell lejátszandó
-    var onOfflineBell: ((soundFile: String) -> Unit)? = null
+    // Callback: offline bell lejátszandó. A TÍPUS is kell, mert `soundFile`
+    // nélküli bejegyzésnél abból dől el, melyik gyári default szóljon.
+    var onOfflineBell: ((soundFile: String, type: String) -> Unit)? = null
+
+    // Szól-e éppen helyi lejátszás. A PlayerService köti be a tényleges
+    // MediaPlayer-állapotra – enélkül csak időbeli becslésünk volt.
+    var isLocalPlaybackActive: (() -> Boolean)? = null
 
     // Két helyi csengetés közti MINIMÁLIS térköz.
     //
@@ -212,10 +213,11 @@ class BellManager(private val ctx: Context) {
         // A lejátszandó hangot zár alatt határozzuk meg, de a callbacket
         // ZÁRON KÍVÜL hívjuk – egy hosszabb hívó ne blokkolja a WS szálat.
         val toPlay = decideNextBell() ?: return
-        onOfflineBell?.invoke(toPlay)
+        onOfflineBell?.invoke(toPlay.first, toPlay.second)
     }
 
-    private fun decideNextBell(): String? = synchronized(stateLock) {
+    /** (hangfájl, típus) vagy null, ha most nincs mit lejátszani. */
+    private fun decideNextBell(): Pair<String, String>? = synchronized(stateLock) {
         if (bells.isEmpty()) return@synchronized null
 
         val now = Calendar.getInstance()
@@ -268,24 +270,27 @@ class BellManager(private val ctx: Context) {
 
             if (key !in armed && reachable && dt < BELL_GRACE_S) continue   // várunk a PREPARE-re
 
-            // Ha az imént indítottunk egyet, NEM teszünk rá másodikat – de a
-            // bejegyzést sem jelöljük elintézettnek: a következő körökben
-            // újrapróbáljuk, amíg a pótlási ablak tart.
+            // Ha épp szól valami, NEM teszünk rá másodikat – de a bejegyzést
+            // sem jelöljük elintézettnek: a következő körökben újrapróbáljuk,
+            // amíg a pótlási ablak tart.
+            //
+            // Elsődlegesen a TÉNYLEGES lejátszás-állapotot nézzük (MediaPlayer);
+            // az időbeli térköz csak tartalék, ha a hívó nem kötött be semmit.
+            if (isLocalPlaybackActive?.invoke() == true) return@synchronized null
             if (System.currentTimeMillis() - lastLocalPlayMs < MIN_LOCAL_GAP_MS) {
                 return@synchronized null
             }
 
-            val sound = b.soundFile.ifBlank {
-                if (b.type.equals("SIGNAL", ignoreCase = true)) DEFAULT_SIGNAL_SOUND
-                else DEFAULT_MAIN_SOUND
-            }
+            // A gyári defaultra esést a BellSoundStore végzi (az APK-ba épített
+            // hangokkal), ezért ide üres `soundFile` is mehet.
+            val sound = b.soundFile
 
             val wasArmed = key in armed
             markEntryHandled(key)          // ordinális; a perc kulcsa csak ha mind kész
             armed.remove(key)
             lastLocalPlayMs = System.currentTimeMillis()
             Log.d(TAG, "OFFLINE csengetés @ $key  hang:$sound (snap=$snapOnline ws=$wsOnline armed=$wasArmed)")
-            return@synchronized sound   // egyszerre csak egy csengetést indítunk
+            return@synchronized Pair(sound, b.type)   // egyszerre csak egyet
         }
         return@synchronized null
     }

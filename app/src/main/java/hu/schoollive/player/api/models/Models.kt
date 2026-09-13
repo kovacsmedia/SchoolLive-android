@@ -45,7 +45,17 @@ data class BellsResponse(
     val ok: Boolean,
     val isHoliday: Boolean,
     val bells: List<Bell>,
-    val defaultBells: List<Bell>
+    val defaultBells: List<Bell>,
+    // A tenant csengetési hangjai (fájlnév + letöltési URL + méret). A kliens
+    // ezeket tölti le helyben, hogy OFFLINE is meg tudjon szólalni – online a
+    // hang a snapcast streamből jön. Régi backend nem küldi → null.
+    val sounds: List<BellSound>? = null
+)
+
+data class BellSound(
+    val filename: String,
+    val url: String,
+    val sizeBytes: Int
 )
 
 // ── Beacon ────────────────────────────────────────────────────────────────────

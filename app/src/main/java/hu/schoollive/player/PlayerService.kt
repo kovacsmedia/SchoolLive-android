@@ -16,7 +16,9 @@ import hu.schoollive.player.sync.BellEvent
 import hu.schoollive.player.sync.RadioEvent
 import hu.schoollive.player.sync.SyncClient
 import hu.schoollive.player.sync.TtsEvent
+import hu.schoollive.player.ui.BellAudioPlayer
 import hu.schoollive.player.ui.BellManager
+import hu.schoollive.player.ui.BellSoundStore
 import hu.schoollive.player.util.OtaCheckWorker
 import hu.schoollive.player.util.OtaManager
 import hu.schoollive.player.util.PrefsUtil
@@ -49,6 +51,8 @@ class PlayerService : Service() {
     private var snapClient: SnapcastClient? = null
     private var syncClient: SyncClient?     = null
     private var bellManager: BellManager?   = null
+    private var soundStore:  BellSoundStore?  = null
+    private var audioPlayer: BellAudioPlayer? = null
 
     // Aktuális automatikus re-mute job (durationMs lejárta után visszanémítja
     // a snap kimenetet a háttér-állapotba). Új lejátszás indítása lemondja.
@@ -75,8 +79,24 @@ class PlayerService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        soundStore  = BellSoundStore(applicationContext)
+        audioPlayer = BellAudioPlayer(applicationContext)
+
         val bm = BellManager(applicationContext)
-        bm.onOfflineBell = { soundFile ->
+        bm.onOfflineBell = { soundFile, type ->
+            /*
+             * OFFLINE CSENGETÉS – ITT SZÓL A HANG.
+             *
+             * Online a hang a snapcast streamből jön, a kliens csak overlay-t
+             * mutat. Offline nincs stream: a készüléknek a SAJÁT másolatából
+             * kell megszólalnia. Ez a lánc eddig HIÁNYZOTT – az overlay
+             * megjelent, hang viszont nem volt.
+             *
+             * A `resolve` a letöltött fájlt adja, ha megvan; ha nincs, az
+             * APK-ba épített gyári defaultot. Csend tehát nem lehet belőle.
+             */
+            soundStore?.resolve(soundFile, type)?.let { audioPlayer?.play(it) }
+
             onBell?.invoke(BellEvent(
                 soundFile  = soundFile,
                 playAtMs   = System.currentTimeMillis(),
@@ -84,6 +104,9 @@ class PlayerService : Service() {
                 snapActive = false,
             ))
         }
+        // A csengetés-állapotgép ebből tudja, hogy épp szól valami helyben,
+        // és nem indít rá egy másodikat.
+        bm.isLocalPlaybackActive = { audioPlayer?.isPlaying == true }
         bellManager = bm
         createNotificationChannel()
         startForeground(NOTIF_ID, buildNotification("Csatlakozás…"))
@@ -128,6 +151,7 @@ class PlayerService : Service() {
         snapClient?.stop()
         syncClient?.stop()
         bellManager?.stop()
+        audioPlayer?.stop()
         scope.cancel()
     }
 
@@ -528,6 +552,10 @@ class PlayerService : Service() {
             val bells = if (body.isHoliday) emptyList() else body.bells
             Log.d(TAG, "Bell refresh: ${bells.size} csengetés (holiday=${body.isHoliday})")
             bellManager?.updateBells(bells)
+
+            // A hangfájlok helyi másolata – enélkül offline csak a gyári
+            // default szólhatna. Már IO dispatcheren vagyunk (bellRefreshLoop).
+            body.sounds?.let { soundStore?.sync(it, serverUrl) }
             withContext(Dispatchers.Main) { onBellsUpdated?.invoke() }
         } catch (e: Exception) {
             Log.w(TAG, "Bell refresh error: ${e.message}")

@@ -26,6 +26,16 @@ private const val TAG = "SnapcastClient"
 
 private const val RECONNECT_DELAY_MS = 3_000L
 
+/*
+ * Ennyi teljes némaság után halottnak tekintjük a kapcsolatot.
+ *
+ * A snapserver üresjáratban is folyamatosan küld (~50 chunk/mp), tehát néhány
+ * másodperc csend nem normális állapot. Ugyanez az érték fut az ESP32-n
+ * (connection_handler.c `SNAP_RX_DEAD_MS`), hogy a két kliens ugyanakkor
+ * döntsön offline-ra.
+ */
+private const val SNAP_RX_DEAD_MS = 8_000
+
 private const val TYPE_CODEC_HEADER = 1
 private const val TYPE_WIRE_CHUNK = 2
 private const val TYPE_SERVER_SETTINGS = 3
@@ -213,6 +223,24 @@ class SnapcastClient(
 
                 socket = Socket(host, port)
                 socket.tcpNoDelay = true
+
+                /*
+                 * OLVASÁSI IDŐKORLÁT – A NÉMA, DE NYITVA MARADT KAPCSOLAT ELLEN.
+                 *
+                 * Eddig nem volt beállítva, tehát ha a snapserver elnémult, de a
+                 * TCP formálisan nyitva maradt (félig nyitott socket: backend-
+                 * újraindítás proxy mögött, elnyelt kapcsolat), a `readLoop`
+                 * ÖRÖKRE blokkolt, az `isConnected` pedig `true` maradt. Az
+                 * eszköz így online-nak hitte magát, holott hang nem jött –
+                 * a csengetés-logika a backendre várt.
+                 *
+                 * A snapserver üresjáratban is folyamatosan küld, ezért néhány
+                 * másodperc teljes némaság halott kapcsolatot jelent. A
+                 * `SocketTimeoutException` a lenti catch-be fut, a `finally`
+                 * pedig `isConnected = false`-t állít és újracsatlakozik –
+                 * pontosan úgy, ahogy az ESP32 teszi (SNAP_RX_DEAD_MS).
+                 */
+                socket.soTimeout = SNAP_RX_DEAD_MS
 
                 val out = socket.getOutputStream()
                 val inp = socket.getInputStream()

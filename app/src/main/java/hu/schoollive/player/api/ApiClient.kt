@@ -28,6 +28,22 @@ object ApiClient {
         return retrofit!!.create(ApiService::class.java)
     }
 
+    /**
+     * Ugyanaz a HTTP-kliens, amit az API is használ.
+     *
+     * A hangfájlok letöltésének (BellSoundStore) UGYANAZT a TLS-beállítást
+     * kell használnia, mint a többi hívásnak – különben a régi Android
+     * eszközökön (elavult tanúsítvány-tár) a letöltés elbukna, miközben
+     * minden más működik. A tünet néma és félrevezető lenne: offline mindig
+     * a gyári default szólna, pedig a hang "fel van töltve".
+     */
+    fun httpClient(): OkHttpClient {
+        if (sharedClient == null) sharedClient = buildOkHttp()
+        return sharedClient!!
+    }
+
+    private var sharedClient: OkHttpClient? = null
+
     private fun buildOkHttp(): OkHttpClient {
         // Belső alkalmazás – minden tanúsítványt elfogadunk
         val trustAll = object : X509TrustManager {
