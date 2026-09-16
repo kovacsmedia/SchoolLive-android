@@ -136,13 +136,35 @@ class SnapcastClient(
     @Volatile
     private var syncOffsetMs: Long = 0L
 
+    /*
+     * Újraszinkron kérése a lejátszó huroknak.
+     *
+     * A hurok a `syncOffsetMs`-t CSAK az induló szinkronizációnál olvassa
+     * (`if (!synced)`), utána a chunkok láncolva mennek. Emiatt egy futás
+     * közbeni módosítás magától soha nem érvényesült – innen jött, hogy a
+     * szinkron-csúszka hatástalannak tűnt. Ezzel a jelzővel kényszerítünk
+     * újraszinkront, a stream megszakítása nélkül.
+     */
+    @Volatile private var resyncRequested = false
+
     /** Manuális sync-eltolás beállítása ms-ben. Pozitív érték → kliens
      *  hátrébb csúszik (későbbi szólalás), negatív → előrébb. A változás a
      *  következő chunk-tól érvényesül; az aktuálisan szóló stream nem
      *  szakad meg (a renderLoop a friss értéket olvassa). */
+    /**
+     * Örökölt út: a `/sync` HELLO-ból érkező érték.
+     *
+     * Az igazság forrása mostantól a snapcast natív `latency` mezője
+     * (ld. `handleServerSettings`), ami minden kliensfajtán egyformán
+     * működik és azonnal hat. Ez a metódus azért maradt meg, hogy egy
+     * régebbi backenddel se maradjon beállítatlanul a kiigazítás.
+     */
     fun setSyncOffset(ms: Long) {
-        syncOffsetMs = ms.coerceIn(-2000L, 2000L)
-        Log.d(TAG, "syncOffsetMs=${syncOffsetMs}ms")
+        val v = ms.coerceIn(0L, 2000L)
+        if (v == syncOffsetMs) return
+        syncOffsetMs = v
+        resyncRequested = true
+        Log.d(TAG, "syncOffsetMs=${syncOffsetMs}ms (HELLO)")
     }
 
     fun getSyncOffset(): Long = syncOffsetMs
@@ -685,6 +707,12 @@ class SnapcastClient(
                 continue
             }
 
+            // Menet közben módosított szinkron-kiigazítás: újrapozicionálunk.
+            if (resyncRequested) {
+                resyncRequested = false
+                synced = false
+            }
+
             // Induláskor várunk egy kis puffert, hogy ne darabosan kezdjen.
             if (!synced && audioQueue.size < initialPrebufferChunks) {
                 delay(10)
@@ -715,7 +743,10 @@ class SnapcastClient(
 
                 if (waitMs > 0) {
                     Log.d(TAG, "Initial sync wait: ${waitMs}ms (bufferMs=$bufferMs, trackLatency=${trackLatencyMs}ms)")
-                    delay(waitMs.coerceAtMost(bufferMs))
+                    // A felső korlátba a szinkron-kiigazítás is beleszámít:
+                    // enélkül egy nagyobb kiigazítás csendben csonkulna a
+                    // puffer hosszára, és pont az összehangolás veszne el.
+                    delay(waitMs.coerceAtMost(bufferMs + syncOffsetMs.coerceAtLeast(0L)))
                 } else {
                     Log.d(TAG, "Initial sync late by ${-waitMs}ms (bufferMs=$bufferMs, trackLatency=${trackLatencyMs}ms), playing without drop")
                 }
@@ -753,6 +784,21 @@ class SnapcastClient(
             val muted = json.optBoolean("muted", false)
             val volume = json.optInt("volume", 100).coerceIn(0, 100)
             val bufferMs = json.optInt("bufferMs", 1000).toLong().coerceIn(200L, 5000L)
+
+            /*
+             * SZINKRON-KIIGAZÍTÁS – a snapcast saját, kliensenkénti `latency`
+             * mezője. Eddig eldobtuk, pedig ez a szabványos mechanizmus az
+             * eltérő hardverek összehangolására: a szerver kliens-azonosító
+             * szerint tárolja, és ebben az üzenetben küldi ki. Pozitív =
+             * később szólal meg. Az ESP firmware ugyanezt az értéket használja
+             * (`cDacLat_ms`), tehát minden kliensfajta egy mechanizmuson megy.
+             */
+            val latency = json.optInt("latency", 0).toLong()
+            if (latency != syncOffsetMs) {
+                Log.d(TAG, "Szinkron-kiigazítás: ${syncOffsetMs}ms → ${latency}ms")
+                syncOffsetMs = latency
+                resyncRequested = true     // azonnal hasson, ne csak újracsatlakozáskor
+            }
 
             // A célzott némítást továbbra is a localMuted logika kezeli.
             // A snapserver muted flagjét és serverVolume-t nem alkalmazzuk

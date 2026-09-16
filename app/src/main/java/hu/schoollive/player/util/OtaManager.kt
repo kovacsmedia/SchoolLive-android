@@ -99,9 +99,48 @@ class OtaManager(private val ctx: Context) {
         })
     }
 
+    /**
+     * Verziószám számokra bontása összehasonlításhoz.
+     *
+     * Elfogad: `1.4.4`, `v1.4.4`, `1.4.4-debug`, `1.4.4+7`.
+     *
+     * KÉT DOLOG FONTOS ITT:
+     *
+     * 1. A kiadás-utótagot (`-debug`, `-rc1`, `+build`) LEVÁGJUK. A debug
+     *    build ugyanannak a verziónak a változata, nem egy korábbi kiadás.
+     *
+     * 2. A tagokat POZÍCIÓHELYESEN képezzük le. A korábbi `mapNotNull`
+     *    KIDOBTA a nem szám alakú tagot, amivel az összes utána jövő eggyel
+     *    előrébb csúszott. Emiatt a `1.4.4-debug` `[1, 4]`-ként parszolódott
+     *    (a "4-debug" eltűnt), a `1.4.4` release pedig `[1, 4, 4]`-ként –
+     *    a harmadik helyen a 4 a hiányzó 0-val szemben "újabbnak" látszott,
+     *    tehát a fejlesztői APK MINDEN ellenőrzésnél frissítést ajánlott
+     *    ugyanarra a verzióra. Ugyanez történt volna egy `V1.4.4` (nagy V)
+     *    tag esetén is, ott a "V1" esett ki.
+     */
+    private fun parseVersion(raw: String): List<Int> {
+        val core = raw.trim()
+            .trimStart('v', 'V')
+            .substringBefore('-')
+            .substringBefore('+')
+        if (core.isEmpty()) return emptyList()
+        return core.split(".").map { part ->
+            part.takeWhile { it.isDigit() }.toIntOrNull() ?: 0
+        }
+    }
+
     private fun isNewerVersion(latest: String, current: String): Boolean {
-        val l = latest.split(".").mapNotNull { it.toIntOrNull() }
-        val c = current.split(".").mapNotNull { it.toIntOrNull() }
+        val l = parseVersion(latest)
+        val c = parseVersion(current)
+
+        /*
+         * Értelmezhetetlen tag (pl. `build-123`, `latest`) → NEM ajánlunk
+         * frissítést. A hiba iránya itt nem mindegy: egy kihagyott értesítést
+         * a következő ellenőrzés behoz, egy hamis értesítést viszont semmi
+         * nem szüntet meg – a felhasználó csak elnyomni tudja, újra és újra.
+         */
+        if (l.isEmpty() || l.all { it == 0 }) return false
+
         for (i in 0 until maxOf(l.size, c.size)) {
             val lv = l.getOrElse(i) { 0 }
             val cv = c.getOrElse(i) { 0 }
