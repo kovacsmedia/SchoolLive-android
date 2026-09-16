@@ -147,6 +147,21 @@ class SnapcastClient(
 
     fun getSyncOffset(): Long = syncOffsetMs
 
+    /**
+     * Mennyi hang van MÁR ÚTON a hangszóró felé, ezredmásodpercben.
+     *
+     * A lejátszás ütemezése `chunk.serverTimestampMs + serverBufferMs +
+     * syncOffsetMs` idejére szól, tehát ennyivel KÉSŐBB szólal meg a hang,
+     * mint ahogy a szerver kiadta. (Az AudioTrack saját DAC-latency-jét nem
+     * kell beleszámolni: azt a `waitMs` már kompenzálja azzal, hogy ennyivel
+     * korábban írja ki a mintákat – a hang így pont a kívánt pillanatban jön ki.)
+     *
+     * A hívónak azért kell: a némítás (`setLocalMute`) az `AudioTrack.setVolume`-on
+     * megy, ami a MÁR BEÍRT mintákra is hat. Aki a lejátszás végén némít, annak
+     * ennyit várnia kell, különben levágja a hang utolsó pillanatait.
+     */
+    fun getOutputLatencyMs(): Long = (serverBufferMs + syncOffsetMs).coerceAtLeast(0L)
+
     private val audioQueue = ArrayBlockingQueue<AudioChunk>(500)
 
     fun start() {

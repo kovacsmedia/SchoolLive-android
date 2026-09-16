@@ -39,6 +39,17 @@ private const val BELLS_REFRESH_INTERVAL_MS = 300_000L
 // nyugta biztosan elhagyja a vonalat (az ESP32 ugyanezt csinálja).
 private const val REBOOT_DELAY_MS           = 1_000L
 
+/*
+ * A snap-kimenet némítása mindig a hang KIFUTÁSA után történik – ld.
+ * `PlayerService.scheduleMuteAfterDrain`. A kifutás mérhető részét a
+ * SnapcastClient adja (`getOutputLatencyMs`), ezek csak a ráhagyások.
+ */
+/** Extra margó a kimeneti puffer kifutásához (chunk-granularitás). */
+private const val MUTE_DRAIN_MARGIN_MS      = 300L
+/** Az auto-remute tartalék-margója a mért kifutáson FELÜL (PREPARE-előretartás
+ *  + a mixer egy másodperces indító csendje + ráhagyás). */
+private const val REMUTE_SAFETY_MS          = 3_000L
+
 class PlayerService : Service() {
 
     inner class LocalBinder : Binder() {
@@ -57,6 +68,8 @@ class PlayerService : Service() {
     // Aktuális automatikus re-mute job (durationMs lejárta után visszanémítja
     // a snap kimenetet a háttér-állapotba). Új lejátszás indítása lemondja.
     private var remuteJob: Job? = null
+    /** Késleltetett némítás STOP_PLAYBACK után – ld. `scheduleMuteAfterDrain`. */
+    private var stopMuteJob: Job? = null
 
     var snapConnected = false; private set
     var wsConnected   = false; private set
@@ -274,9 +287,10 @@ class PlayerService : Service() {
                     if (targeted) onRadio?.invoke(event)
                 },
                 onStop  = {
-                    // Lejátszás vége → minden esetben visszanémítjuk a snap kimenetet.
+                    // Lejátszás vége → visszanémítjuk a snap kimenetet, DE csak
+                    // miután a már úton lévő hang tényleg kiszólt.
                     remuteJob?.cancel(); remuteJob = null
-                    snapClient?.setLocalMute(true)
+                    scheduleMuteAfterDrain("STOP_PLAYBACK")
                     onStop?.invoke()
                 },
                 // Backend SET_VOLUME (admin UI slider / mute gomb): a kapott
@@ -424,6 +438,33 @@ class PlayerService : Service() {
         // hangerő-gombja) hozza vissza a kívánt szintet.
     }
 
+    /**
+     * Némítás a kimeneti puffer KIFUTÁSA után.
+     *
+     * MIÉRT NEM AZONNAL: a `setLocalMute` az `AudioTrack.setVolume`-on megy,
+     * ami a track pufferébe MÁR BEÍRT mintákra is hat – nem csak a jövőbeliekre.
+     * A snap-kliens viszont eleve előre dolgozik: a hang a szerver időbélyegéhez
+     * képest `serverBufferMs` (alapból 1000 ms) + a kézi szinkron-eltolás
+     * idejével később szólal meg. Amikor tehát a STOP_PLAYBACK megérkezik, a
+     * hang utolsó másodperce még a hangszóró felé tart – az azonnali némítás
+     * pont ezt vágta le.
+     *
+     * Az ESP-n ezért nincs ilyen: ott a helyi lejátszó saját maga futtatja
+     * végig a fájlt, nem egy távolról némítható stream-kimeneten.
+     *
+     * A `stopMuteJob`-ot minden új lejátszás lemondja (ld. `applyTargeting`),
+     * így egy gyorsan érkező következő hangot nem némíthat el utólag.
+     */
+    private fun scheduleMuteAfterDrain(reason: String) {
+        stopMuteJob?.cancel()
+        val drainMs = snapClient?.getOutputLatencyMs() ?: 0L
+        stopMuteJob = scope.launch {
+            if (drainMs > 0) delay(drainMs + MUTE_DRAIN_MARGIN_MS)
+            snapClient?.setLocalMute(true)
+            Log.d(TAG, "Némítás ($reason) ${drainMs}ms kifutás után")
+        }
+    }
+
     /** Backend fordított targetingjének lokális fallbackje.
      *
      *  A snap stream alapból néma (localMuted = true). Ha a kliens benne van
@@ -451,8 +492,11 @@ class PlayerService : Service() {
             && unmutedDeviceIds.isNotEmpty()
             && !unmutedDeviceIds.contains(myId)
 
-        // Bármi is történik, az előző auto-remute timert lemondjuk.
+        // Bármi is történik, az előző auto-remute timert lemondjuk – és a
+        // függőben lévő STOP-némítást is: ha új hang indul, azt nem szabad
+        // egy korábbi lejátszás kifutás-időzítőjének elnémítania.
         remuteJob?.cancel(); remuteJob = null
+        stopMuteJob?.cancel(); stopMuteJob = null
 
         if (certainlyNotTargeted) {
             // Biztosan nem célzott → néma + HUD-ot sem mutatunk
@@ -469,10 +513,23 @@ class PlayerService : Service() {
         durationMs?.let { dur ->
             if (dur > 0) {
                 remuteJob = scope.launch {
-                    // Egy kis biztonsági margó, hogy a lejátszás teljesen befejeződjön.
-                    delay(dur + 3000L)
+                    /*
+                     * A `durationMs` a hang hossza, az időzítés kezdőpontja
+                     * viszont EZ A PILLANAT – amikor a WS-parancs megérkezett.
+                     * A hang ennél később szólal meg és később is ér véget:
+                     * a szerver előretartással küld (PREPARE), a mixer egy
+                     * másodperc csenddel indít, a snap-kliens pedig a saját
+                     * pufferével (+ kézi szinkron-eltolással) játszik.
+                     *
+                     * Ebből a klienspuffer a mérhető rész – azt hozzáadjuk.
+                     * A maradékot a fix margó fedi. Ez amúgy is csak tartalék
+                     * háló: normál esetben a szerver STOP_PLAYBACK-je némít
+                     * előbb (az is kivárja a kifutást, ld. lent).
+                     */
+                    val drainMs = snapClient?.getOutputLatencyMs() ?: 0L
+                    delay(dur + drainMs + REMUTE_SAFETY_MS)
                     snapClient?.setLocalMute(true)
-                    Log.d(TAG, "Auto-remute durationMs (${dur}ms + safety) lejárt")
+                    Log.d(TAG, "Auto-remute lejárt (dur=${dur}ms + kifutás=${drainMs}ms + margó)")
                 }
             }
         }
