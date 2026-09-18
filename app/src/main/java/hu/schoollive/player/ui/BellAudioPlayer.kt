@@ -85,11 +85,23 @@ class BellAudioPlayer(private val ctx: Context) {
                 }
                 is BellSoundStore.Source.Bundled -> {
                     Log.d(TAG, "Lejátszás (gyári default)")
-                    // Tömörített erőforrásnál null jönne vissza; az .mp3-at az
-                    // aapt nem tömöríti, de ne NPE-zzünk, ha mégis.
+                    /*
+                     * TÖMÖRÍTETT ERŐFORRÁSNÁL az openRawResourceFd() null-t ad.
+                     *
+                     * Az aapt alapból nem tömöríti az .mp3-at, az .opus viszont
+                     * nincs garantáltan a listáján – ezért a build.gradle-ben
+                     * `noCompress 'opus'` áll. Ez itt a MÁSODIK védővonal: ha az
+                     * a beállítás valaha kiesne, a gyári default akkor se
+                     * maradjon néma, hanem a cache-be kicsomagolva szólaljon meg.
+                     */
                     val afd = ctx.resources.openRawResourceFd(source.resId)
-                        ?: throw IllegalStateException("openRawResourceFd null")
-                    afd.use { mp.setDataSource(it.fileDescriptor, it.startOffset, it.length) }
+                    if (afd != null) {
+                        afd.use { mp.setDataSource(it.fileDescriptor, it.startOffset, it.length) }
+                    } else {
+                        Log.w(TAG, "openRawResourceFd null (tömörített erőforrás?) – kicsomagolás cache-be")
+                        val cached = extractBundled(source.resId)
+                        mp.setDataSource(cached.absolutePath)
+                    }
                 }
             }
 
@@ -159,6 +171,27 @@ class BellAudioPlayer(private val ctx: Context) {
         } catch (e: Exception) {
             Log.w(TAG, "Hangfókusz kérése sikertelen: ${e.message}")
         }
+    }
+
+    /**
+     * Gyári default erőforrás kicsomagolása a cache-be, hogy útvonalról is
+     * lejátszható legyen.
+     *
+     * Csak akkor fut, ha az `openRawResourceFd()` null-t adott. A fájlt
+     * újrahasznosítjuk, ha már kint van – csengetésenként másolni felesleges.
+     */
+    private fun extractBundled(resId: Int): java.io.File {
+        val out = java.io.File(ctx.cacheDir, "bundled_$resId.audio")
+        if (out.exists() && out.length() > 0L) return out
+        ctx.resources.openRawResource(resId).use { input ->
+            java.io.File(out.parentFile, out.name + ".tmp").let { tmp ->
+                tmp.outputStream().use { input.copyTo(it) }
+                if (tmp.length() == 0L) { tmp.delete(); throw IllegalStateException("üres erőforrás") }
+                if (out.exists()) out.delete()
+                tmp.renameTo(out)
+            }
+        }
+        return out
     }
 
     private fun releaseFocus() {

@@ -11,8 +11,44 @@ android {
         applicationId "hu.schoollive.player"
         minSdk 21
         targetSdk 34
-        versionCode 6
-        versionName "1.6.3"
+        versionCode 7
+        versionName "2.0.0"
+
+        /*
+         * A BACKEND ALAP-URL-JE – FELÜLÍRHATÓ A BUILDBŐL.
+         *
+         * Eddig fordítási idejű konstans volt (ProvisioningActivity.SERVER_URL),
+         * tehát egy tesztszerverre irányított build forráskód-módosítást
+         * igényelt. Ugyanaz a minta, mint az ESP32 firmware-nél
+         * (platformio.ini [env:esp32dev-test] → -DBACKEND_BASE_URL=...).
+         *
+         *   ./gradlew assembleDebug -PslBaseUrl=https://test.schoollive.hu
+         *
+         * Megadás nélkül az ÉLES cím marad, tehát a CI és a kiadási build
+         * változatlan. A tanúsítvány nem akadály: az app minden hálózati útja
+         * a trust-all OkHttp kliensen megy (ApiClient, SyncClient,
+         * BellSoundStore), a MediaPlayer pedig csak helyi fájlt játszik.
+         *
+         * ⚠️ ISKOLÁBA SOHA NE MENJEN teszt-URL-lel fordított build.
+         */
+        buildConfigField "String", "SERVER_URL",
+            "\"${project.findProperty('slBaseUrl') ?: 'https://api.schoollive.hu'}\""
+    }
+
+    androidResources {
+        /*
+         * AZ .opus ERŐFORRÁST NEM SZABAD TÖMÖRÍTENI.
+         *
+         * A gyári default csengetőhangok a res/raw-ban vannak, és a lejátszó
+         * `openRawResourceFd()`-del nyitja őket – az TÖMÖRÍTETT erőforrásnál
+         * null-t ad. Az aapt alapértelmezett "ne tömörítsd" listáján az .mp3
+         * rajta van, az .opus viszont nem garantáltan: enélkül a formátum-
+         * váltás után a VÉGSŐ TARTALÉK csengetés maradna néma.
+         *
+         * (A BellAudioPlayer emellett tartalék ágat is kapott erre az esetre –
+         * ez a beállítás az első védővonal, az a második.)
+         */
+        noCompress 'opus'
     }
 
     buildTypes {

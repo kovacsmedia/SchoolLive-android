@@ -15,6 +15,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.mindrot.jbcrypt.BCrypt
+import hu.schoollive.player.BuildConfig
 
 class ProvisioningActivity : AppCompatActivity() {
 
@@ -22,7 +23,12 @@ class ProvisioningActivity : AppCompatActivity() {
     private var polling = false
 
     companion object {
-        const val SERVER_URL = "https://api.schoollive.hu"
+        /**
+         * A backend alap-URL-je. A buildből jön (ld. app/build.gradle
+         * `slBaseUrl`), így a tesztszerverre irányítás nem igényel
+         * forráskód-módosítást. Alapértelmezés: az éles cím.
+         */
+        val SERVER_URL: String = BuildConfig.SERVER_URL
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
